@@ -94,24 +94,55 @@ def _coerce_param_types(args: dict) -> dict:
     return coerced
 
 
-def _parse_query_string_lenient(qs: str) -> dict:
-    """Parse query string with full decoding including + → space.
+_CONTENT_PARAM_NAMES = {"content", "contents", "file_content", "command"}
 
-    Handles standard application/x-www-form-urlencoded where + means space.
-    Uses unquote_plus for comprehensive decoding.
+
+def _parse_query_string_lenient(qs: str) -> dict:
+    """Parse query string handling content params that may contain & and =.
+
+    Content-like parameters (content, contents, command) are extracted
+    greedily: everything from '&content=' to end-of-string is the value.
+    This prevents file content containing & or = from being split.
+
+    For non-content params: unquote_plus (+ → space).
+    For content params: unquote (+ preserved as literal +).
     """
-    from urllib.parse import unquote_plus
+    from urllib.parse import unquote, unquote_plus
     args: dict[str, str] = {}
     if not qs:
         return args
-    for pair in qs.split("&"):
-        eq_idx = pair.find("=")
-        if eq_idx < 0:
-            continue
-        key = pair[:eq_idx]
-        val = pair[eq_idx + 1:]
-        val = unquote_plus(val)
-        args[key] = val
+
+    content_idx = -1
+    content_key = ""
+    for cname in _CONTENT_PARAM_NAMES:
+        for prefix in [f"&{cname}=", f"{cname}="]:
+            idx = qs.find(prefix)
+            if idx >= 0:
+                actual = idx + len(prefix)
+                if prefix.startswith("&") or idx == 0:
+                    if content_idx < 0 or idx < content_idx:
+                        content_idx = idx
+                        content_key = cname
+
+    if content_idx >= 0:
+        before = qs[:content_idx]
+        sep = f"&{content_key}=" if content_idx > 0 else f"{content_key}="
+        raw_val = qs[content_idx + len(sep):]
+        args[content_key] = unquote(raw_val)
+
+        for pair in before.split("&"):
+            if not pair:
+                continue
+            eq_idx = pair.find("=")
+            if eq_idx < 0:
+                continue
+            args[pair[:eq_idx]] = unquote_plus(pair[eq_idx + 1:])
+    else:
+        for pair in qs.split("&"):
+            eq_idx = pair.find("=")
+            if eq_idx < 0:
+                continue
+            args[pair[:eq_idx]] = unquote_plus(pair[eq_idx + 1:])
     return args
 
 
