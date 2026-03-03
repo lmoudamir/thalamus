@@ -161,8 +161,7 @@ def parse_resource_uri(uri: str) -> tuple[str | None, dict]:
 
     if query_idx >= 0 and (fragment_idx < 0 or query_idx < fragment_idx):
         scheme_part = uri[:query_idx]
-        qs_end = fragment_idx if fragment_idx > query_idx else len(uri)
-        qs_str = uri[query_idx + 1:qs_end]
+        qs_str = uri[query_idx + 1:]
         tool_name = _URI_SCHEME_TO_TOOL.get(scheme_part)
         if tool_name and qs_str:
             args = _parse_query_string_lenient(qs_str)
