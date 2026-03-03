@@ -5,12 +5,13 @@ Extract tool call JSON from LLM text output.
 from __future__ import annotations
 
 import json
-import logging
 import re
 import uuid
 from typing import Any
 
-_logger = logging.getLogger(__name__)
+from utils.structured_logging import ThalamusStructuredLogger
+
+_logger = ThalamusStructuredLogger.get_logger("tool-parser", "DEBUG")
 
 
 def extract_balanced_text(
@@ -236,6 +237,8 @@ def _parse_tool_calls_json_candidate(raw_text: str) -> list[dict] | None:
     try:
         parsed = relaxed_json_parse(raw_text)
     except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(parsed, dict):
         return None
     if parsed and isinstance(parsed.get("tool_calls"), list):
         return normalize_tool_calls(parsed["tool_calls"])
@@ -507,6 +510,98 @@ def _legacy_parse_natural_language(text: str) -> list[dict] | None:
     return None
 
 
+KNOWN_TOOL_NAMES = {
+    "Read", "Write", "Edit", "MultiEdit", "Bash", "Glob", "Grep",
+    "WebFetch", "WebSearch", "TodoRead", "TodoWrite", "Task",
+    "fetch_mcp_resource", "mcp__pencil",
+}
+
+
+def _parse_text_mimicry(text: str) -> list[dict] | None:
+    """Catch ANY text that mimics a tool call — regardless of surrounding format.
+
+    Patterns caught:
+      [Called Tool: X] ... Arguments: {...}
+      <tool_executed name="X" input={...} />
+      (Executed X with {...})
+      X({"key": "val"})
+    """
+    results: list[dict] = []
+
+    patterns = [
+        # [Called Tool: X] (id=...) Arguments: {...}
+        re.compile(
+            r'\[Called Tool:\s*(\w+)\]\s*(?:\(id=[^)]*\))?\s*(?:Arguments?:\s*)',
+            re.DOTALL,
+        ),
+        # <tool_executed name="X" input={...} />
+        re.compile(
+            r'<tool_executed\s+name="(\w+)"\s+input=',
+            re.DOTALL,
+        ),
+        # (Executed X with {...})
+        re.compile(
+            r'\(Executed\s+(\w+)\s+with\s+',
+            re.DOTALL,
+        ),
+    ]
+
+    for pat in patterns:
+        for m in pat.finditer(text):
+            tool_name = m.group(1)
+            if tool_name not in KNOWN_TOOL_NAMES:
+                continue
+            rest = text[m.end():]
+            brace_idx = rest.find("{")
+            if brace_idx < 0 or brace_idx > 10:
+                continue
+            balanced = extract_balanced_text(rest, brace_idx, "{", "}")
+            if not balanced:
+                continue
+            try:
+                args_obj = json.loads(balanced)
+                if isinstance(args_obj, dict):
+                    results.append({
+                        "id": f"call_{uuid.uuid4().hex[:12]}",
+                        "type": "function",
+                        "function": {
+                            "name": tool_name,
+                            "arguments": json.dumps(args_obj),
+                        },
+                    })
+            except json.JSONDecodeError:
+                pass
+
+    if results:
+        return results
+
+    # Fallback: ToolName followed by JSON anywhere in text
+    for name in KNOWN_TOOL_NAMES:
+        for m in re.finditer(re.escape(name) + r'\s*[\(\{:]?\s*', text):
+            rest = text[m.end():]
+            brace_idx = rest.find("{")
+            if brace_idx < 0 or brace_idx > 5:
+                continue
+            balanced = extract_balanced_text(rest, brace_idx, "{", "}")
+            if not balanced:
+                continue
+            try:
+                args_obj = json.loads(balanced)
+                if isinstance(args_obj, dict) and args_obj:
+                    results.append({
+                        "id": f"call_{uuid.uuid4().hex[:12]}",
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": json.dumps(args_obj),
+                        },
+                    })
+            except json.JSONDecodeError:
+                pass
+
+    return results if results else None
+
+
 def try_parse_tool_calls_from_text(
     text: str,
     strict_json_only: bool = True,
@@ -519,7 +614,15 @@ def try_parse_tool_calls_from_text(
         return None
     trimmed = text.strip()
     preview = trimmed[:180]
-    _logger.debug("Parsing text len=%d preview=%s", len(trimmed), preview)
+    snippet = re.sub(r"\s+", " ", trimmed[:160])
+    _logger.debug(f"Parsing text len={len(trimmed)} preview={preview}")
+
+    mimicry_result = _parse_text_mimicry(trimmed)
+    if mimicry_result:
+        _logger.info(
+            f"parse_strategy=text_mimicry_intercept raw_len={len(trimmed)} candidate_snippet={snippet}"
+        )
+        return mimicry_result
 
     strategies: list[tuple[str, callable]] = [
         ("direct_json", parse_tool_calls_from_direct_json),
@@ -536,18 +639,13 @@ def try_parse_tool_calls_from_text(
         result = parser(trimmed)
         if result:
             _logger.info(
-                "parse_strategy=strict_json:%s raw_len=%d candidate_snippet=%s",
-                name,
-                len(trimmed),
-                re.sub(r"\s+", " ", trimmed[:160]),
+                f"parse_strategy=strict_json:{name} raw_len={len(trimmed)} candidate_snippet={snippet}"
             )
             return result
 
     if strict_json_only:
         _logger.info(
-            "parse_strategy=strict_json:none raw_len=%d candidate_snippet=%s",
-            len(trimmed),
-            re.sub(r"\s+", " ", trimmed[:160]),
+            f"parse_strategy=strict_json:none raw_len={len(trimmed)} candidate_snippet={snippet}"
         )
         _logger.debug(
             "strict_json_only=True and no valid JSON tool_calls found; skip heuristic parsing"
@@ -564,16 +662,11 @@ def try_parse_tool_calls_from_text(
         result = parser(trimmed)
         if result:
             _logger.info(
-                "parse_strategy=legacy_heuristic:%s raw_len=%d candidate_snippet=%s",
-                name,
-                len(trimmed),
-                re.sub(r"\s+", " ", trimmed[:160]),
+                f"parse_strategy=legacy_heuristic:{name} raw_len={len(trimmed)} candidate_snippet={snippet}"
             )
             return result
 
     _logger.info(
-        "parse_strategy=legacy_heuristic:none raw_len=%d candidate_snippet=%s",
-        len(trimmed),
-        re.sub(r"\s+", " ", trimmed[:160]),
+        f"parse_strategy=legacy_heuristic:none raw_len={len(trimmed)} candidate_snippet={snippet}"
     )
     return None

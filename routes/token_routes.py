@@ -1,4 +1,3 @@
-import logging
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
@@ -7,8 +6,9 @@ from core.token_manager import (
     set_cursor_access_token,
     get_cursor_access_token,
 )
+from utils.structured_logging import ThalamusStructuredLogger
 
-logger = logging.getLogger(__name__)
+logger = ThalamusStructuredLogger.get_logger("token-routes", "DEBUG")
 router = APIRouter()
 
 @router.get("/token/status")

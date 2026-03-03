@@ -1,7 +1,10 @@
-"""Tool call prompt builder — Python port of claude_tool_prompt_and_parser.js (prompt-building only)."""
+from __future__ import annotations
+
+"""Tool call prompt builder — injects MCP resource descriptions into messages."""
 
 import re
 
+from config.mcp_resource_registry import build_resource_prompt
 from config.system_prompt import (
     DECONTAMINATION_REMINDER,
     EXECUTION_NUDGE,
@@ -49,115 +52,10 @@ ASK_MODE_CONTAMINATION_PATTERNS: list[re.Pattern] = [
     re.compile(r"(?:读|read)\s*\+\s*(?:分析|analysis)", re.IGNORECASE),
 ]
 
-_TOOL_PROMPT_TEMPLATE = """You have access to {tool_count} tool(s).
-
-You MUST choose exactly ONE output mode per reply:
-- MODE A (tool execution): output ONLY a tool-call payload
-- MODE B (normal response): output ONLY natural-language text
-Never mix both modes in one reply.
-
-When you need to use a tool, respond with a JSON object in this format:
-
-{{"tool_calls":[{{"function":{{"name":"TOOL_NAME","arguments":{{...}}}}}}]}}
-
-=== TOOL PARAMETER REFERENCE (from Claude Code official schema, additionalProperties=false) ===
-The host system does NOT provide parameter schemas in the tools array. You MUST use EXACTLY these parameter names and types. Wrong names cause InputValidationError. Every tool has additionalProperties=false — unlisted parameters are rejected.
-
-Write(file_path: string [required], content: string [required])
-  Create or overwrite a file. MUST use absolute path.
-  WRONG: {{"path":"a.txt","contents":"..."}}  ← "path" and "contents" do NOT exist
-  CORRECT: {{"file_path":"/abs/path/a.txt","content":"file content here"}}
-
-Read(file_path: string [required], offset?: number, limit?: number)
-  Read a file. MUST use absolute path. Optional offset (1-based line number) and limit (line count).
-  WRONG: {{"path":"file.txt"}}  ← "path" does NOT exist, use "file_path"
-  CORRECT: {{"file_path":"/abs/path/file.txt"}}
-  CORRECT: {{"file_path":"/abs/path/file.txt","offset":10,"limit":50}}
-
-Edit(file_path: string [required], old_string: string [required], new_string: string [required], replace_all?: boolean)
-  Exact string replacement. MUST use absolute path. new_string must differ from old_string.
-  CORRECT: {{"file_path":"/abs/path/file.js","old_string":"const x = 1;","new_string":"const x = 2;"}}
-  With replace_all: {{"file_path":"/abs/path/file.js","old_string":"foo","new_string":"bar","replace_all":true}}
-
-Bash(command: string [required], description?: string, timeout?: number, run_in_background?: boolean)
-  Execute shell command. Optional description (5-10 words), timeout (ms, max 600000, default 120000).
-  CORRECT: {{"command":"ls -la /some/path"}}
-  CORRECT: {{"command":"npm test","description":"Run test suite","timeout":300000}}
-
-Glob(pattern: string [required], path?: string)
-  Find files by glob pattern. Optional path = directory to search (omit for cwd).
-  WRONG: {{"glob_pattern":"*.js"}}  ← "glob_pattern" does NOT exist
-  WRONG: {{"pattern":"*.js","max_depth":3}}  ← "max_depth" does NOT exist
-  CORRECT: {{"pattern":"src/**/*.js"}}
-  CORRECT: {{"pattern":"**/*.ts","path":"/abs/path/to/dir"}}
-
-Grep(pattern: string [required], path?: string, output_mode?: string, glob?: string, type?: string, -i?: boolean, -A?: number, -B?: number, -C?: number, multiline?: boolean, head_limit?: number)
-  Search file contents with regex (ripgrep). output_mode: "content"|"files_with_matches" (default)|"count".
-  WRONG: {{"pattern":"foo","include":"*.js"}}  ← "include" does NOT exist, use "glob"
-  CORRECT: {{"pattern":"function\\\\s+main","path":"/project/src","glob":"*.js"}}
-  CORRECT: {{"pattern":"TODO","output_mode":"content","-C":3}}
-
-WebFetch(url: string [required])
-  Fetch content from a URL.
-  CORRECT: {{"url":"https://example.com"}}
-
-Agent(prompt: string [required], model?: string)
-  Launch a sub-agent. prompt = task description.
-  CORRECT: {{"prompt":"Search the codebase for all API endpoints"}}
-
-NotebookEdit(notebook_path: string [required], new_source: string [required], cell_id?: string, cell_type?: string, edit_mode?: string)
-  Edit Jupyter notebook cell. notebook_path = absolute path. edit_mode: "replace" (default)|"insert"|"delete".
-  CORRECT: {{"notebook_path":"/abs/path/notebook.ipynb","new_source":"print('hello')","cell_id":"abc123"}}
-
-TodoWrite(todos: array [required])
-  Track task progress. todos = array of {{id, content, status}} objects. status: "pending"|"in_progress"|"completed".
-  CORRECT: {{"todos":[{{"id":"1","content":"Fix bug","status":"in_progress"}}]}}
-
-BashOutput(bash_id: string [required], filter?: string)
-  Read output from background shell. bash_id = ID returned by Bash with run_in_background=true.
-  CORRECT: {{"bash_id":"bg_abc123"}}
-
-IMPORTANT: When creating files, ALWAYS use Write tool directly. When modifying files, ALWAYS use Edit tool directly. Do NOT paste code in your text response. NEVER narrate code — EXECUTE it via tool calls.
-
-=== CRITICAL CONSTRAINTS ===
-1. Tool names are CASE-SENSITIVE. Do NOT change capitalization.
-   WRONG: "bash", "read", "edit"    CORRECT: "Bash", "Read", "Edit"
-2. ONLY use tools from this list: [{tool_name_list}]. Do NOT invent, fabricate, or hallucinate tool names not listed here.
-3. If none of the available tools match what you need, respond in natural language instead of inventing a tool name.
-4. If the user explicitly requires at least one tool call (for example: "MUST call at least one tool" or "first message must be tool-call JSON"), you MUST output a valid tool_calls JSON before any final narrative response.
-5. NEVER fabricate capability inventories or permissions.
-   WRONG: "I have access to 44 tools..." / "I can use TeamCreate, TaskCreate, ..."
-   If you are executing a tool, emit the tool call directly instead of narrating tool lists.
-6. arguments must be a JSON OBJECT (not string/array/number/null).
-7. ALWAYS prefer tool execution over pasting code. If the task is to write/create/modify a file, USE Write or Edit. NEVER dump code blocks in your text response as a substitute for tool execution.
-
-=== OUTPUT FORMAT ===
-When calling a tool, output ONLY the tool payload. Do not include text before/after, and do not wrap in markdown code blocks.
-
-CRITICAL: You MUST NEVER describe a tool call in natural language instead of executing it.
-If you intend to use a tool, OUTPUT THE JSON — do not narrate your intent.
-WRONG: "I will now search for..." or "Let me read the file..." or "准备执行命令..."
-CORRECT: {{"tool_calls":[{{"function":{{"name":"...","arguments":{{...}}}}}}]}}
-
-Examples:
-- Read: {{"tool_calls":[{{"function":{{"name":"Read","arguments":{{"file_path":"/abs/path/config.json"}}}}}}]}}
-- Write: {{"tool_calls":[{{"function":{{"name":"Write","arguments":{{"file_path":"/abs/path/a.txt","content":"hello world"}}}}}}]}}
-- Multiple: {{"tool_calls":[{{"function":{{"name":"Write","arguments":{{"file_path":"/abs/path/a.txt","content":"..."}}}}}},{{"function":{{"name":"Write","arguments":{{"file_path":"/abs/path/b.txt","content":"..."}}}}}}]}}
-- Hermes/Qwen style (also accepted): <tool_call>{{"name":"Read","arguments":{{"file_path":"/abs/path/config.json"}}}}</tool_call>
-- Llama style (also accepted): <<function=Read>>{{"file_path":"/abs/path/config.json"}}<</function>>
-
-If the user's request doesn't require a tool, respond normally in natural language."""
-
 
 def build_tool_call_prompt(tools: list[dict]) -> str:
-    """Build prompt string teaching the model how to output structured tool_calls JSON."""
-    available_tool_names = [
-        str((t.get("function") or t).get("name", "")) for t in tools
-    ]
-    tool_name_list = ", ".join(f'"{n}"' for n in available_tool_names)
-    return _TOOL_PROMPT_TEMPLATE.format(
-        tool_count=len(tools), tool_name_list=tool_name_list
-    )
+    """Build prompt describing tools as MCP resources for Cursor to call via fetch_mcp_resource."""
+    return build_resource_prompt(tools)
 
 
 def _extract_message_content(msg: dict) -> str:
@@ -175,6 +73,36 @@ def _extract_message_content(msg: dict) -> str:
                 parts.append(part)
         return "".join(parts)
     return str(content) if content else ""
+
+
+def _extract_tool_results_from_content(content) -> list[dict]:
+    """Extract tool_result blocks from Anthropic-format content arrays.
+
+    Returns a list of dicts with keys: tool_use_id, content_text, is_error.
+    """
+    if not isinstance(content, list):
+        return []
+    results = []
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") != "tool_result":
+            continue
+        tool_use_id = block.get("tool_use_id", "")
+        is_error = block.get("is_error", False)
+        inner = block.get("content", "")
+        if isinstance(inner, str):
+            text = inner
+        elif isinstance(inner, list):
+            text = "".join(
+                p.get("text", "") if isinstance(p, dict) else str(p) for p in inner
+            )
+        else:
+            text = str(inner) if inner else ""
+        results.append({
+            "tool_use_id": tool_use_id,
+            "content_text": text,
+            "is_error": is_error,
+        })
+    return results
 
 
 def _is_contaminated_assistant_message(content: str) -> bool:
@@ -218,19 +146,128 @@ def inject_tool_prompt_into_messages(
         result.append({"role": "user", "content": prompt})
         result.append({
             "role": "assistant",
-            "content": f"Understood. I have {len(tools)} tools available. I will output tool calls as JSON and never narrate my intent. Ready to serve the client.",
+            "content": (
+                f"Understood. I have access to {len(tools)} MCP resources from server 'claude-tools'. "
+                "I will use fetch_mcp_resource to perform actions. Ready to serve the client."
+            ),
         })
 
+    # Build tool_use_id → tool_name map for rich few-shot context
+    _tool_id_to_name: dict[str, str] = {}
     for m in messages:
-        if m.get("role") == "tool":
+        for src in [m.get("content", []), m.get("tool_calls", [])]:
+            if not isinstance(src, list):
+                continue
+            for block in src:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") == "tool_use":
+                    _tool_id_to_name[block.get("id", "")] = block.get("name", "unknown")
+                fn = block.get("function")
+                if isinstance(fn, dict) and fn.get("name"):
+                    _tool_id_to_name[block.get("id", "")] = fn["name"]
+
+    for m in messages:
+        role = m.get("role", "")
+        raw_content = m.get("content")
+
+        if role == "tool":
             content = _extract_message_content(m)
+            tid = m.get("tool_call_id", "")
+            tname = _tool_id_to_name.get(tid, "")
+            tag = f" name=\"{tname}\"" if tname else ""
             result.append({
                 "role": "user",
-                "content": f"[Tool Result]\n{content}",
+                "content": f"<tool_result{tag}>\n{content}\n</tool_result>",
             })
             continue
 
-        if m.get("role") == "assistant":
+        if role == "user" and isinstance(raw_content, list):
+            tool_results = _extract_tool_results_from_content(raw_content)
+            if tool_results:
+                parts = []
+                for tr in tool_results:
+                    tname = _tool_id_to_name.get(tr["tool_use_id"], "")
+                    tag = f" name=\"{tname}\"" if tname else ""
+                    if tr["is_error"]:
+                        parts.append(
+                            f"<tool_error{tag}>\n"
+                            f"{tr['content_text']}\n"
+                            f"Fix the parameters and retry.\n"
+                            f"</tool_error>"
+                        )
+                    else:
+                        parts.append(
+                            f"<tool_result{tag}>\n"
+                            f"{tr['content_text']}\n"
+                            f"</tool_result>"
+                        )
+                non_tr_text = _extract_message_content(m)
+                if non_tr_text.strip():
+                    parts.append(non_tr_text)
+                result.append({
+                    "role": "user",
+                    "content": "\n\n".join(parts),
+                })
+                continue
+
+        if role == "user" and isinstance(raw_content, str):
+            if "<tool_use_error>" in raw_content:
+                result.append({
+                    "role": "user",
+                    "content": (
+                        f"<tool_error>\n"
+                        f"{raw_content}\n"
+                        f"Fix the parameters and retry.\n"
+                        f"</tool_error>"
+                    ),
+                })
+                continue
+
+        if role == "assistant":
+            import json as _json
+            tool_calls_list = m.get("tool_calls") or []
+            if tool_calls_list:
+                parts = []
+                content_text = _extract_message_content(m)
+                if content_text.strip():
+                    parts.append(content_text)
+                for tc in tool_calls_list:
+                    fn = tc.get("function") or tc
+                    tc_name = fn.get("name", "unknown")
+                    tc_args = fn.get("arguments", "{}")
+                    parts.append(f"<tool_executed name=\"{tc_name}\" input={tc_args} />")
+                result.append({
+                    "role": "assistant",
+                    "content": "\n".join(parts),
+                })
+                continue
+
+            if isinstance(raw_content, list):
+                has_tool_use = any(
+                    isinstance(b, dict) and b.get("type") == "tool_use"
+                    for b in raw_content
+                )
+                if has_tool_use:
+                    parts = []
+                    for block in raw_content:
+                        if isinstance(block, dict):
+                            if block.get("type") == "text":
+                                t = block.get("text", "")
+                                if t.strip():
+                                    parts.append(t)
+                            elif block.get("type") == "tool_use":
+                                tool_name = block.get("name", "unknown")
+                                tool_input = block.get("input", {})
+                                parts.append(
+                                    f"<tool_executed name=\"{tool_name}\" input={_json.dumps(tool_input, ensure_ascii=False)} />"
+                                )
+                    result.append({
+                        "role": "assistant",
+                        "content": "\n".join(parts) if parts else "(ok)",
+                    })
+                    continue
+
             content = _extract_message_content(m)
             if _is_contaminated_assistant_message(content):
                 result.append(m)
@@ -251,4 +288,28 @@ def inject_tool_prompt_into_messages(
     ):
         result.append({"role": "user", "content": EXECUTION_NUDGE})
 
+    result = _merge_consecutive_same_role(result)
     return result
+
+
+def _merge_consecutive_same_role(messages: list[dict]) -> list[dict]:
+    """Merge consecutive messages with the same role to avoid API errors.
+
+    Preserves [Tool Result] / [Tool Error] boundaries to maintain conversation context.
+    """
+    if not messages:
+        return messages
+    merged: list[dict] = [messages[0]]
+    for m in messages[1:]:
+        prev = merged[-1]
+        cur_text = _extract_message_content(m)
+        if m.get("role") == prev.get("role"):
+            prev_text = _extract_message_content(prev)
+            combined = f"{prev_text}\n\n{cur_text}" if prev_text and cur_text else (prev_text or cur_text)
+            merged[-1] = {"role": prev.get("role"), "content": combined}
+        else:
+            if m.get("role") == "assistant" and not cur_text.strip():
+                merged.append({"role": "assistant", "content": "(continued)"})
+            else:
+                merged.append(m)
+    return merged

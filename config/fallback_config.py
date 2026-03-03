@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 Claude Code model fallback configuration.
 

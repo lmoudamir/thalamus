@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 Main pipeline module — the heart of thalamus-py.
 
@@ -13,25 +14,31 @@ Pipeline flow:
   6. Assemble Anthropic SSE output
 """
 
-from __future__ import annotations
-
 import asyncio
 import json
-import logging
 import os
 import re
 import time
 import uuid
 from typing import Any, AsyncIterator, Callable
 
+from utils.structured_logging import ThalamusStructuredLogger
+
 from core.token_manager import get_cursor_access_token
 from core.bearer_token import strip_cursor_user_prefix
+from utils.llm_payload_logger import (
+    log_llm_request,
+    log_llm_response,
+    log_llm_api_call,
+)
 from core.protobuf_builder import (
     build_gzip_framed_protobuf_chat_request_body,
     compute_sha256_hex_digest,
     generate_obfuscated_machine_id_checksum,
 )
+from config.mcp_resource_registry import parse_resource_uri
 from core.protobuf_frame_parser import ProtobufFrameParser
+from core.protobuf_tool_call_parser import ToolCall
 from core.cursor_h2_client import open_streaming_h2_request
 from claude_code.tool_prompt_builder import (
     build_tool_call_prompt,
@@ -45,7 +52,7 @@ from claude_code.sse_assembler import (
 from config.tool_registry import post_process_tool_calls
 from config.fallback_config import load_fallback_config
 
-logger = logging.getLogger("thalamus.pipeline")
+logger = ThalamusStructuredLogger.get_logger("pipeline", "DEBUG")
 
 FATAL_ERROR_PATTERNS: list[re.Pattern] = [
     re.compile(r"unable\s+to\s+reach\s+the\s+model\s+provider", re.I),
@@ -73,14 +80,20 @@ def normalize_content(content: Any) -> str:
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        return " ".join(
-            item.get("text") or item.get("content") or ""
-            for item in content
-            if isinstance(item, dict)
-        ).strip()
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                raw = item.get("text") or item.get("content") or ""
+                parts.append(normalize_content(raw) if not isinstance(raw, str) else raw)
+            elif isinstance(item, list):
+                parts.append(normalize_content(item))
+        return " ".join(parts).strip()
     if isinstance(content, dict):
-        return content.get("text") or content.get("content") or ""
-    return ""
+        raw = content.get("text") or content.get("content") or ""
+        return normalize_content(raw) if not isinstance(raw, str) else raw
+    return str(content) if content is not None else ""
 
 
 def _remove_uri_format(schema: Any) -> Any:
@@ -491,12 +504,20 @@ async def consume_stream(
     stream_iterator: AsyncIterator[bytes],
     on_text_delta: Callable[[str], Any] | None = None,
     on_thinking_delta: Callable[[str], Any] | None = None,
+    on_tool_call: Callable[[ToolCall], Any] | None = None,
 ) -> dict:
-    """Consume a Cursor protobuf stream, accumulating text/thinking/errors."""
+    """Consume a Cursor protobuf stream, accumulating text/thinking/errors/tool_calls.
+
+    When a tool call is detected, we break out of the stream immediately since
+    Cursor holds the connection open waiting for a tool result. The caller is
+    responsible for handling tool result return in a follow-up request.
+    """
     parser = ProtobufFrameParser()
     text = ""
     thinking = ""
     errors: list[Any] = []
+    proto_tool_calls: list[ToolCall] = []
+    seen_tc_ids: set[str] = set()
     had_content = False
     has_fatal_error = False
     chunk_count = 0
@@ -504,13 +525,20 @@ async def consume_stream(
     thinking_delta_count = 0
     stream_start = time.monotonic()
     first_chunk_latency_ms: float | None = None
+    got_tool_call = False
 
     async for chunk in stream_iterator:
         chunk_count += 1
         if first_chunk_latency_ms is None:
             first_chunk_latency_ms = (time.monotonic() - stream_start) * 1000
+        logger.debug(f"[consume] chunk#{chunk_count} len={len(chunk)} hex_head={chunk[:20].hex()}")
 
         result = parser.parse(chunk)
+        logger.debug(
+            f"[consume] chunk#{chunk_count} parsed: text_len={len(result.text)} "
+            f"thinking_len={len(result.thinking)} tool_calls={len(result.tool_calls)} "
+            f"errors={len(result.errors)}"
+        )
 
         if result.errors:
             errors.extend(result.errors)
@@ -531,11 +559,33 @@ async def consume_stream(
             had_content = True
             if on_text_delta:
                 on_text_delta(result.text)
+            logger.debug(f"[consume] text so far ({len(text)} chars): ...{text[-200:]}")
+
+        for tc in result.tool_calls:
+            logger.info(f"[consume] TOOL CALL detected: enum={tc.enum} id={tc.tool_call_id} name={tc.name}")
+            if tc.tool_call_id not in seen_tc_ids:
+                seen_tc_ids.add(tc.tool_call_id)
+                proto_tool_calls.append(tc)
+                had_content = True
+                got_tool_call = True
+                if on_tool_call:
+                    on_tool_call(tc)
+
+        if got_tool_call:
+            errors = [
+                e for e in errors
+                if not (hasattr(e, "detail") and "Tool call ended" in str(e.detail))
+            ]
+            text = ""
+            has_fatal_error = False
+            logger.info(f"[consume] Breaking stream after tool call (chunks={chunk_count})")
+            break
 
     return {
         "text": text,
         "thinking": thinking,
         "errors": errors,
+        "proto_tool_calls": proto_tool_calls,
         "had_content": had_content,
         "has_fatal_error": has_fatal_error,
         "metrics": {
@@ -577,12 +627,15 @@ async def _call_cursor_direct(
 
     while len(tried_models) < fallback_cfg.max_attempts:
         logger.info(
-            "[%s] Calling Cursor direct | model=%s | tools=%d | msgs=%d | attempt=%d",
-            request_id, current_model, len(valid_tool_names),
-            len(injected_base), len(tried_models) + 1,
+            f"[{request_id}] Calling Cursor direct | model={current_model} | tools={len(valid_tool_names)} | msgs={len(injected_base)} | attempt={len(tried_models) + 1}"
         )
 
         attempt_start = time.monotonic()
+
+        req_payload_path = log_llm_request(
+            request_id, current_model, injected_base,
+            extra={"tools": len(valid_tool_names), "attempt": len(tried_models) + 1},
+        )
 
         try:
             path, headers, body = build_cursor_stream_params(
@@ -596,7 +649,7 @@ async def _call_cursor_direct(
                 )
         except Exception as exc:
             err_msg = str(exc)
-            logger.error("[%s] Connection/stream error: %s", request_id, err_msg)
+            logger.error(f"[{request_id}] Connection/stream error: {err_msg}")
             if fallback_cfg.should_fallback(err_msg):
                 tried_models.append(current_model)
                 next_model = fallback_cfg.select_next_model(
@@ -604,10 +657,18 @@ async def _call_cursor_direct(
                 )
                 if next_model:
                     logger.info(
-                        "[%s] Fallback: %s -> %s", request_id, current_model, next_model
+                        f"[{request_id}] Fallback: {current_model} -> {next_model}"
                     )
                     current_model = next_model
                     continue
+            latency = int((time.monotonic() - attempt_start) * 1000)
+            res_payload_path = log_llm_response(
+                request_id, current_model, "", error=err_msg, latency_ms=latency,
+            )
+            log_llm_api_call(
+                request_id, current_model, "ERROR", latency,
+                req_payload_path, res_payload_path, error=err_msg,
+            )
             return {
                 "error": err_msg,
                 "status": 503,
@@ -622,18 +683,15 @@ async def _call_cursor_direct(
 
         if should_fallback_from_stream:
             err_detail = _first_error_detail(consumed["errors"])
-            logger.warning(
-                "[%s] Stream error: %s | had_content=%s fatal=%s",
-                request_id, err_detail,
-                consumed["had_content"], consumed["has_fatal_error"],
+            logger.warn(
+                f"[{request_id}] Stream error: {err_detail} | had_content={consumed['had_content']} fatal={consumed['has_fatal_error']}"
             )
             if fallback_cfg.should_fallback(err_detail):
                 tried_models.append(current_model)
                 next_model = fallback_cfg.select_next_model(model, tried_models)
                 if next_model:
                     logger.info(
-                        "[%s] Fallback: %s -> %s (stream error)",
-                        request_id, current_model, next_model,
+                        f"[{request_id}] Fallback: {current_model} -> {next_model} (stream error)"
                     )
                     current_model = next_model
                     continue
@@ -645,11 +703,53 @@ async def _call_cursor_direct(
             }
 
         metrics = consumed["metrics"]
+        proto_tcs = consumed.get("proto_tool_calls") or []
+        attempt_latency = int((time.monotonic() - attempt_start) * 1000)
         logger.info(
-            "[%s] Stream consumed | text_len=%d thinking_len=%d errors=%d chunks=%d first_token_ms=%.0f",
-            request_id, len(consumed["text"]), len(consumed["thinking"]),
-            len(consumed["errors"]), metrics["chunk_count"],
-            metrics["first_chunk_latency_ms"],
+            f"[{request_id}] Stream consumed | text_len={len(consumed['text'])} thinking_len={len(consumed['thinking'])} "
+            f"proto_tool_calls={len(proto_tcs)} errors={len(consumed['errors'])} "
+            f"chunks={metrics['chunk_count']} first_token_ms={metrics['first_chunk_latency_ms']:.0f}"
+        )
+
+        converted_tcs = _convert_proto_tool_calls_to_anthropic(proto_tcs) if proto_tcs else []
+        if converted_tcs:
+            converted_tcs = _fix_garbled_paths_in_tool_calls(converted_tcs)
+
+        if proto_tcs and not converted_tcs:
+            logger.warn(
+                f"[{request_id}] All {len(proto_tcs)} proto tool call(s) had incomplete args — retrying"
+            )
+            tried_models.append(current_model)
+            next_model = fallback_cfg.select_next_model(model, tried_models)
+            if next_model:
+                current_model = next_model
+            continue
+
+        if not converted_tcs and valid_tool_names:
+            converted_tcs_from_text = try_parse_tool_calls_from_text(consumed["text"])
+            if converted_tcs_from_text:
+                result = post_process_tool_calls(converted_tcs_from_text, valid_tool_names)
+                converted_tcs = result.get("processed") or []
+                if converted_tcs:
+                    converted_tcs = _fix_garbled_paths_in_tool_calls(converted_tcs)
+                logger.info(f"[{request_id}] Fallback text-parsed tool calls: {len(converted_tcs)}")
+
+        res_payload_path = log_llm_response(
+            request_id, current_model, consumed["text"],
+            tool_calls=converted_tcs or None,
+            error=_first_error_detail(consumed["errors"]) if consumed["errors"] else None,
+            latency_ms=attempt_latency,
+            extra={
+                "thinking_len": len(consumed["thinking"]),
+                "chunks": metrics["chunk_count"],
+                "proto_tool_calls": len(proto_tcs),
+            },
+        )
+        log_llm_api_call(
+            request_id, current_model,
+            "OK" if not consumed["errors"] else "STREAM_ERROR",
+            attempt_latency, req_payload_path, res_payload_path,
+            error=_first_error_detail(consumed["errors"]) if consumed["errors"] else None,
         )
 
         if not has_valid_tools:
@@ -661,64 +761,242 @@ async def _call_cursor_direct(
                 "stats": {"passed": 0, "normalized": 0, "filtered": 0, "invalid_arguments_filtered": 0},
             }
 
-        raw_tool_calls = try_parse_tool_calls_from_text(consumed["text"])
+        if converted_tcs:
+            raw_names = [(tc.get("function") or {}).get("name", "?") for tc in converted_tcs]
+            logger.info(f"[{request_id}] Tool calls: {json.dumps([{'name': n} for n in raw_names])}")
 
-        if raw_tool_calls:
-            raw_names = [
-                (tc.get("function") or {}).get("name", "?") for tc in raw_tool_calls
-            ]
-            logger.info(
-                "[%s] Parsed tool calls: %s", request_id,
-                json.dumps([{"name": n} for n in raw_names]),
-            )
-
-            result = post_process_tool_calls(raw_tool_calls, valid_tool_names)
-            processed = result["processed"]
-            stats = result["stats"]
-
-            if processed:
-                text_before = extract_text_before_json(consumed["text"])
-                return {
-                    "tool_calls": processed,
-                    "text": text_before,
-                    "thinking": consumed["thinking"],
-                    "model": current_model,
-                    "stats": stats,
-                    "fallback_attempts": len(tried_models),
-                }
-
-            logger.info(
-                "[%s] All parsed tool calls filtered (false positive) — returning as text",
-                request_id,
-            )
+            text_before = consumed["text"] if not proto_tcs else ""
             return {
-                "text": consumed["text"],
+                "tool_calls": converted_tcs,
+                "text": text_before,
                 "thinking": consumed["thinking"],
                 "model": current_model,
-                "stats": stats,
+                "stats": {"passed": len(converted_tcs), "normalized": 0, "filtered": 0, "invalid_arguments_filtered": 0},
                 "fallback_attempts": len(tried_models),
             }
 
+        final_text = consumed["text"]
+        if "Tool call ended before result was received" in final_text:
+            final_text = final_text.replace("[Error] Tool call ended before result was received", "").strip()
+            logger.info(f"[{request_id}] Filtered Cursor abort text from response")
         logger.info(
-            "[%s] Text response (no tool calls) | len=%d | %.0fms",
-            request_id, len(consumed["text"]),
-            (time.monotonic() - start_time) * 1000,
+            f"[{request_id}] Text response (no tool calls) | len={len(final_text)} | {(time.monotonic() - start_time) * 1000:.0f}ms"
         )
         return {
-            "text": consumed["text"],
+            "text": final_text,
             "thinking": consumed["thinking"],
             "model": current_model,
             "fallback_attempts": len(tried_models),
             "stats": {"passed": 0, "normalized": 0, "filtered": 0, "invalid_arguments_filtered": 0},
         }
 
-    logger.error("[%s] All fallback models exhausted", request_id)
+    logger.error(f"[{request_id}] All fallback models exhausted")
     return {
         "error": "All available models are currently unavailable",
         "status": 503,
         "fallback_attempts": len(tried_models),
         "model": None,
     }
+
+
+def _fix_garbled_paths_in_tool_calls(tool_calls: list[dict]) -> list[dict]:
+    """Fix character corruption in paths by filesystem lookup — no hardcoded char maps.
+
+    Walk each path segment top-down; when a segment doesn't exist, fuzzy-match
+    against the real directory listing to find the closest real name.
+    Works for ANY character corruption as long as the real file/dir exists on disk.
+
+    Safety rules:
+      - Only fix directory segments, not the final filename (Write may create new files)
+      - Require same length + ≥80% char match to avoid false positives
+      - For Bash commands: only fix paths that look like they reference existing trees
+      - Don't swap quote styles if the path contains single-quotes or $variables
+    """
+    _listdir_cache: dict[str, list[str]] = {}
+
+    def _cached_listdir(d: str) -> list[str]:
+        if d not in _listdir_cache:
+            try:
+                _listdir_cache[d] = os.listdir(d)
+            except OSError:
+                _listdir_cache[d] = []
+        return _listdir_cache[d]
+
+    def _fuzzy_match_segment(parent: str, broken_seg: str) -> str | None:
+        children = _cached_listdir(parent)
+        if not children:
+            return None
+        if broken_seg in children:
+            return broken_seg
+
+        best, best_score = None, 0
+        seg_len = len(broken_seg)
+        for child in children:
+            if len(child) != seg_len:
+                continue
+            score = sum(a == b for a, b in zip(child, broken_seg))
+            if score > best_score:
+                best_score = score
+                best = child
+
+        threshold = max(seg_len * 0.8, seg_len - 2)
+        if best and best_score >= threshold:
+            return best
+
+        broken_lower = broken_seg.lower()
+        for child in children:
+            if child.lower() == broken_lower:
+                return child
+        return None
+
+    def _fix_path(p: str, fix_last_segment: bool = True) -> str:
+        """Fix garbled segments in an absolute path.
+
+        fix_last_segment=False means the final component (filename) won't be
+        fuzzy-matched — used for Write/Edit where the file may not exist yet.
+        """
+        if not p or not p.startswith("/") or os.path.exists(p):
+            return p
+
+        parts = p.split("/")
+        rebuilt = ""
+        fixed = False
+        last_idx = len(parts) - 1
+        for i, seg in enumerate(parts):
+            if not seg:
+                rebuilt += "/"
+                continue
+            candidate = rebuilt + seg
+            if os.path.exists(candidate):
+                rebuilt = candidate + ("/" if i < last_idx else "")
+                continue
+            if i == last_idx and not fix_last_segment:
+                rebuilt += seg
+                continue
+            real = _fuzzy_match_segment(rebuilt if rebuilt else "/", seg)
+            if real and real != seg:
+                logger.info(f"[path-fix] segment '{seg}' → '{real}' in {rebuilt}")
+                rebuilt += real + ("/" if i < last_idx else "")
+                fixed = True
+            else:
+                rebuilt += seg + ("/" if i < last_idx else "")
+
+        if fixed and rebuilt != p:
+            return rebuilt.rstrip("/") if not p.endswith("/") else rebuilt
+        return p
+
+    def _fix_paths_in_string(s: str) -> str:
+        """Find absolute paths in Bash commands and fix garbled segments.
+
+        Only swaps double→single quotes when a path was actually fixed AND
+        the fixed path contains shell-dangerous chars (!) AND it's safe
+        (no single-quotes or $variables in the context).
+        """
+        patterns = [
+            re.compile(r'"(/[^"]+)"'),
+            re.compile(r"'(/[^']+)'"),
+            re.compile(r'(?:^|[ =])(/[^\s"\']+(?:\\ [^\s"\']+)*)'),
+            re.compile(r'(?<=\n)(/[^\s"\']+)'),
+        ]
+        result = s
+        for pat in patterns:
+            def _make_replacer(p: re.Pattern) -> callable:
+                def _replacer(m: re.Match) -> str:
+                    original = m.group(1)
+                    if not original.startswith("/"):
+                        return m.group(0)
+                    fixed_p = _fix_path(original)
+                    if fixed_p == original:
+                        return m.group(0)
+                    new_match = m.group(0).replace(original, fixed_p)
+                    if "!" in fixed_p and '"' in m.group(0):
+                        if "'" not in fixed_p and "$" not in m.group(0):
+                            new_match = new_match.replace(f'"{fixed_p}"', f"'{fixed_p}'")
+                    return new_match
+                return _replacer
+            result = pat.sub(_make_replacer(pat), result)
+        return result
+
+    WRITE_TOOLS = {"Write", "Edit", "MultiEdit"}
+
+    result = []
+    for tc in tool_calls:
+        fn = tc.get("function", {})
+        name = fn.get("name", "")
+        raw_args = fn.get("arguments", "{}")
+        try:
+            args = json.loads(raw_args)
+        except (json.JSONDecodeError, ValueError, TypeError):
+            result.append(tc)
+            continue
+        if not isinstance(args, dict):
+            result.append(tc)
+            continue
+
+        changed = False
+        is_write = name in WRITE_TOOLS
+
+        for key in ("file_path", "path", "pattern"):
+            if key in args and isinstance(args[key], str) and args[key].startswith("/"):
+                fixed = _fix_path(args[key], fix_last_segment=not is_write)
+                if fixed != args[key]:
+                    args[key] = fixed
+                    changed = True
+
+        if name == "Bash" and "command" in args and isinstance(args["command"], str):
+            fixed = _fix_paths_in_string(args["command"])
+            if fixed != args["command"]:
+                args["command"] = fixed
+                changed = True
+
+        if changed:
+            tc = {
+                **tc,
+                "function": {**fn, "arguments": json.dumps(args)},
+            }
+        result.append(tc)
+    return result
+
+
+def _convert_proto_tool_calls_to_anthropic(proto_tcs: list[ToolCall]) -> list[dict]:
+    """Convert protobuf ToolCall objects (from MCP resource URIs) to Anthropic tool_use format."""
+    result = []
+    for tc in proto_tcs:
+        logger.debug(
+            f"[convert] TC enum={tc.enum} id={tc.tool_call_id} name={tc.name} "
+            f"raw_args({len(tc.raw_args)})={tc.raw_args[:300]} "
+            f"args_keys={list(tc.args.keys()) if tc.args else 'EMPTY'}"
+        )
+
+        if tc.enum == 45:
+            uri = tc.args.get("uri") or tc.raw_args
+            if uri:
+                tool_name, tool_args = parse_resource_uri(uri)
+                logger.debug(f"[convert] parse_resource_uri({uri[:200]}) => name={tool_name} args_keys={list(tool_args.keys()) if tool_args else 'EMPTY'}")
+                if tool_name and tool_args:
+                    result.append({
+                        "id": tc.tool_call_id,
+                        "type": "function",
+                        "function": {
+                            "name": tool_name,
+                            "arguments": json.dumps(tool_args),
+                        },
+                    })
+                    continue
+                elif tool_name and not tool_args:
+                    logger.warn(f"[convert] Skipping tool call {tool_name} with empty args (URI fragment missing or empty)")
+                    continue
+
+        if tc.name and tc.args:
+            result.append({
+                "id": tc.tool_call_id,
+                "type": "function",
+                "function": {
+                    "name": tc.name,
+                    "arguments": json.dumps(tc.args),
+                },
+            })
+    return result
 
 
 def _first_error_detail(errors: list) -> str:
@@ -789,18 +1067,30 @@ async def run_claude_messages_pipeline(
     if controls.get("stop") is not None:
         unsupported.append("stop")
 
-    token = _extract_raw_auth_token(auth_token) or get_cursor_access_token()
+    raw_req_token = _extract_raw_auth_token(auth_token)
+    # Only use request-supplied token if it looks like a real Cursor token
+    # (contains :: or starts with eyJ). Otherwise fall back to stored token.
+    if raw_req_token and ("::" in raw_req_token or raw_req_token.startswith("eyJ")):
+        token = raw_req_token
+    else:
+        token = get_cursor_access_token()
 
     logger.info(
-        "[%s] pipeline=claude_code model=%s stream=%s tools=%d msgs=%d max_tokens=%s",
-        request_id, resolved_model, stream,
-        len(valid_tool_names), len(messages),
-        max_tokens or "-",
+        f"[{request_id}] pipeline=claude_code model={resolved_model} stream={stream} tools={len(valid_tool_names)} msgs={len(messages)} max_tokens={max_tokens or '-'}"
     )
+    if valid_tool_names and len(messages) <= 5:
+        logger.info(f"[{request_id}] CC tool names: {valid_tool_names}")
+        for t in tools[:5]:
+            fn = t.get("function") or t
+            tname = fn.get("name", "")
+            tschema = fn.get("input_schema") or fn.get("parameters") or {}
+            req_params = tschema.get("required", [])
+            props = list((tschema.get("properties") or {}).keys())
+            logger.info(f"[{request_id}] CC tool schema: {tname} props={props} required={req_params}")
 
     if unsupported:
-        logger.warning(
-            "[%s] Unsupported controls: %s", request_id, ", ".join(unsupported)
+        logger.warn(
+            f"[{request_id}] Unsupported controls: {', '.join(unsupported)}"
         )
         return {
             "ok": False,
@@ -840,15 +1130,18 @@ async def run_claude_messages_pipeline(
             limiter = _OutputLimiter(max_tokens)
             sse_queue: asyncio.Queue[str | None] = asyncio.Queue()
 
-            forwarder = ToolJsonAwareTextForwarder(
-                emit_text_delta=lambda chunk: session.emit_text_delta(chunk),
-                limiter=limiter,
-            )
+            _CURSOR_ABORT_TEXT = "Tool call ended before result was received"
 
             def on_text_delta(delta: str) -> None:
-                sse = forwarder.on_delta(delta)
-                if sse:
-                    sse_queue.put_nowait(sse)
+                if not delta:
+                    return
+                if _CURSOR_ABORT_TEXT in delta or delta.strip().startswith("[Error]"):
+                    return
+                limited = limiter.emit_within_limit(delta)
+                if limited:
+                    sse = session.emit_text_delta(limited)
+                    if sse:
+                        sse_queue.put_nowait(sse)
 
             def on_thinking_delta(delta: str) -> None:
                 if not delta:
@@ -880,53 +1173,14 @@ async def run_claude_messages_pipeline(
 
             if direct_result.get("error"):
                 logger.error(
-                    "[%s] pipeline=claude_code stage=error(stream) error=%s",
-                    request_id, direct_result["error"],
+                    f"[{request_id}] pipeline=claude_code stage=error(stream) error={direct_result['error']}"
                 )
                 yield session.finish(stop_reason="end_turn")
                 return
 
-            safe_text = direct_result.get("text", "")
             tool_calls = direct_result.get("tool_calls") or []
-            stats = direct_result.get("stats") or {}
-
-            flush_sse = forwarder.flush_using_final_safe_text(safe_text)
-            if flush_sse:
-                yield flush_sse
 
             yield session.close_open_blocks()
-
-            text_is_done = "done!!" in safe_text
-            needs_continuation = (
-                not tool_calls
-                and not text_is_done
-                and safe_text
-                and "Bash" in valid_tool_names
-            )
-
-            if needs_continuation:
-                nudge_id = f"toolu_nudge_{uuid.uuid4().hex[:12]}"
-                nudge_msg = (
-                    "[SYSTEM] Your previous turn was text-only. "
-                    "Task NOT done -> call a tool now (Write/Edit/Bash/Read). "
-                    "Task IS done -> respond with done!! as your FINAL word. "
-                    "No exceptions. Act immediately."
-                )
-                tool_calls.append({
-                    "id": nudge_id,
-                    "type": "function",
-                    "function": {
-                        "name": "Bash",
-                        "arguments": json.dumps({
-                            "command": f"echo '{nudge_msg}'",
-                            "description": "continuation nudge",
-                        }),
-                    },
-                })
-                logger.info(
-                    "[%s] Injected continuation nudge (no tool calls, no done!!)",
-                    request_id,
-                )
 
             if tool_calls:
                 yield session.emit_tool_use_blocks(tool_calls)
@@ -934,7 +1188,7 @@ async def run_claude_messages_pipeline(
             stop_reason: str
             if tool_calls:
                 stop_reason = "tool_use"
-            elif limiter.is_exhausted and not tool_calls:
+            elif limiter.is_exhausted:
                 stop_reason = "max_tokens"
             else:
                 stop_reason = "end_turn"
@@ -944,9 +1198,8 @@ async def run_claude_messages_pipeline(
             used_model = direct_result.get("model") or resolved_model
             latency = _elapsed_ms(pipeline_start)
             logger.info(
-                "[%s] pipeline=claude_code stage=result(stream) model=%s "
-                "tool_calls=%d stop_reason=%s latency_ms=%.0f",
-                request_id, used_model, len(tool_calls), stop_reason, latency,
+                f"[{request_id}] pipeline=claude_code stage=result(stream) model={used_model} "
+                f"tool_calls={len(tool_calls)} stop_reason={stop_reason} latency_ms={latency:.0f}"
             )
 
         return {
@@ -963,11 +1216,7 @@ async def run_claude_messages_pipeline(
     )
 
     logger.info(
-        "[%s] DIRECT_RESULT(unary): text_len=%d tool_calls=%d error=%s",
-        request_id,
-        len(direct_result.get("text", "")),
-        len(direct_result.get("tool_calls") or []),
-        direct_result.get("error"),
+        f"[{request_id}] DIRECT_RESULT(unary): text_len={len(direct_result.get('text', ''))} tool_calls={len(direct_result.get('tool_calls') or [])} error={direct_result.get('error')}"
     )
 
     if direct_result.get("error"):
@@ -1009,9 +1258,8 @@ async def run_claude_messages_pipeline(
     }
 
     logger.info(
-        "[%s] pipeline=claude_code stage=result model=%s tool_calls=%d "
-        "text_len=%d latency_ms=%.0f",
-        request_id, used_model, len(tool_calls), len(text), telemetry["latency_ms"],
+        f"[{request_id}] pipeline=claude_code stage=result model={used_model} tool_calls={len(tool_calls)} "
+        f"text_len={len(text)} latency_ms={telemetry['latency_ms']:.0f}"
     )
 
     return {

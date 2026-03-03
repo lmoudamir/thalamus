@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 Bearer token extraction and Cursor JWT conversion.
 
@@ -9,11 +10,12 @@ The Cursor API only accepts the raw JWT part, so we strip the prefix.
 Clients may also pass multiple comma-separated tokens for load-distribution.
 """
 
-import logging
 import re
 from urllib.parse import unquote
 
-logger = logging.getLogger('thalamus.bearer-token')
+from utils.structured_logging import ThalamusStructuredLogger
+
+logger = ThalamusStructuredLogger.get_logger("bearer-token", "DEBUG")
 
 
 def extract_bearer_tokens(authorization_header: str | None) -> list[str]:

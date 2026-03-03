@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 Cursor Access Token Manager (Singleton).
 
@@ -12,14 +13,15 @@ captured and stored so that internal subsystems can make loopback
 calls without the original request.
 """
 
-import logging
 import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import unquote
 
-logger = logging.getLogger('thalamus.token-manager')
+from utils.structured_logging import ThalamusStructuredLogger
+
+logger = ThalamusStructuredLogger.get_logger("token-manager", "DEBUG")
 
 ENV_FILE_PATH = Path(__file__).resolve().parent.parent / '.env'
 
@@ -42,7 +44,7 @@ def _init_from_environment() -> None:
         _store['token'] = env_token
         _store['source'] = 'env'
         _store['captured_at'] = _now_iso()
-        logger.info('Token loaded from env | length=%d | prefix=%s...', len(env_token), env_token[:20])
+        logger.info(f'Token loaded from env | length={len(env_token)} | prefix={env_token[:20]}...')
 
 
 def get_cursor_access_token() -> str:
@@ -58,7 +60,7 @@ def set_cursor_access_token(new_token: str | None, source: str = 'api') -> None:
     _store['captured_at'] = _now_iso() if new_token else None
 
     if new_token:
-        logger.info('Token set | source=%s | length=%d | prefix=%s...', source, len(new_token), new_token[:20])
+        logger.info(f'Token set | source={source} | length={len(new_token)} | prefix={new_token[:20]}...')
     else:
         logger.info('Token cleared')
 
@@ -117,9 +119,9 @@ def capture_token_from_request(authorization_header: str | None) -> None:
         _store['captured_at'] = _now_iso()
 
         if old_len == 0:
-            logger.info('Token auto-captured from request | length=%d | prefix=%s...', len(token), token[:20])
+            logger.info(f'Token auto-captured from request | length={len(token)} | prefix={token[:20]}...')
         else:
-            logger.info('Token auto-refreshed from request | length=%d (was %d)', len(token), old_len)
+            logger.info(f'Token auto-refreshed from request | length={len(token)} (was {old_len})')
 
         _persist_to_dot_env(token)
 
@@ -141,7 +143,7 @@ def _persist_to_dot_env(token: str) -> None:
             env_content += f'\n# Cursor authentication token (auto-managed by Thalamus)\n{new_token_line}\n'
 
         ENV_FILE_PATH.write_text(env_content, encoding='utf-8')
-        logger.info('Token persisted to .env | length=%d', len(token))
+        logger.info(f'Token persisted to .env | length={len(token)}')
     except Exception:
         logger.exception('Failed to persist token to .env')
 

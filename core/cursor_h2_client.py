@@ -1,12 +1,10 @@
+from __future__ import annotations
 """
 HTTP/2 client for Cursor API (api2.cursor.sh).
 
 Connects to the Cloudflare IP while preserving correct TLS SNI (api2.cursor.sh).
 """
 
-from __future__ import annotations
-
-import logging
 import os
 import ssl
 from collections.abc import AsyncIterator
@@ -15,7 +13,9 @@ from contextlib import asynccontextmanager
 import httpx
 import httpcore
 
-logger = logging.getLogger(__name__)
+from utils.structured_logging import ThalamusStructuredLogger
+
+logger = ThalamusStructuredLogger.get_logger("h2-client", "DEBUG")
 
 CURSOR_CLOUDFLARE_IP: str = os.environ.get("CURSOR_CLOUDFLARE_IP", "104.18.19.125")
 CURSOR_API_HOST: str = "api2.cursor.sh"
@@ -47,7 +47,7 @@ class _CloudflareOverrideBackend(httpcore.AsyncNetworkBackend):
     ) -> httpcore.AsyncNetworkStream:
         target = CURSOR_CLOUDFLARE_IP if host == CURSOR_API_HOST else host
         if target != host:
-            logger.debug("DNS override: %s -> %s:%d", host, target, port)
+            logger.debug(f"DNS override: {host} -> {target}:{port}")
         return await self._inner.connect_tcp(
             target, port,
             timeout=timeout,
@@ -97,19 +97,33 @@ async def open_streaming_h2_request(
     headers: dict[str, str],
     body: bytes,
 ) -> AsyncIterator[AsyncIterator[bytes]]:
-    """Open a server-streaming HTTP/2 POST to api2.cursor.sh."""
+    """Open a server-streaming HTTP/2 POST to api2.cursor.sh.
+
+    The caller can break out of the iterator early (e.g. after receiving a tool
+    call). The context manager will forcefully close the connection rather than
+    waiting for the server to finish the stream.
+    """
     client = _build_client()
+    response_ctx = client.stream("POST", path, headers=headers, content=body)
+    response = await response_ctx.__aenter__()
     try:
-        async with client.stream(
-            "POST", path, headers=headers, content=body,
-        ) as response:
-            logger.debug(
-                "Streaming response started: status=%d path=%s",
-                response.status_code, path,
-            )
-            yield response.aiter_bytes()
+        logger.debug(
+            f"Streaming response started: status={response.status_code} path={path}"
+        )
+        yield response.aiter_bytes()
     finally:
-        await client.aclose()
+        try:
+            await response.aclose()
+        except Exception:
+            pass
+        try:
+            await response_ctx.__aexit__(None, None, None)
+        except Exception:
+            pass
+        try:
+            await client.aclose()
+        except Exception:
+            pass
 
 
 async def send_unary_h2_request(
@@ -121,7 +135,6 @@ async def send_unary_h2_request(
     async with _build_client() as client:
         response = await client.post(path, headers=headers, content=body)
         logger.debug(
-            "Unary response: status=%d path=%s size=%d",
-            response.status_code, path, len(response.content),
+            f"Unary response: status={response.status_code} path={path} size={len(response.content)}"
         )
         return {"status": response.status_code, "buffer": response.content}

@@ -12,3 +12,6 @@ build/
 .mypy_cache/
 .pytest_cache/
 vendor/
+logs/
+.DS_Store
+_raw_cc_request.json

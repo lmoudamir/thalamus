@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 Cursor <-> Claude Code bidirectional tool name and argument mapping.
 

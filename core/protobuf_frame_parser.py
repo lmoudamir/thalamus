@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 Cursor streaming response frame parser with cross-chunk buffering.
 
@@ -12,17 +13,17 @@ Magic 2/3 carry JSON error messages (raw / gzip-compressed).
 Port of: cursor_streaming_response_protobuf_frame_parser.js
 """
 
-from __future__ import annotations
-
 import gzip
 import json
-import logging
 import struct
 from dataclasses import dataclass, field
 
 from proto import cursor_api_pb2 as pb
 
-logger = logging.getLogger(__name__)
+from core.protobuf_tool_call_parser import ToolCall, extract_tool_calls_from_frame
+from utils.structured_logging import ThalamusStructuredLogger
+
+logger = ThalamusStructuredLogger.get_logger("protobuf-parser", "DEBUG")
 
 
 @dataclass
@@ -38,6 +39,7 @@ class ParseResult:
     thinking: str = ""
     text: str = ""
     errors: list[ParsedError] = field(default_factory=list)
+    tool_calls: list[ToolCall] = field(default_factory=list)
 
 
 class ProtobufFrameParser:
@@ -54,6 +56,8 @@ class ProtobufFrameParser:
         thinking_parts: list[str] = []
         text_parts: list[str] = []
         errors: list[ParsedError] = []
+        tool_calls: list[ToolCall] = []
+        seen_tc_ids: set[str] = set()
 
         while len(self._buf) >= 5:
             magic = self._buf[0]
@@ -68,6 +72,7 @@ class ProtobufFrameParser:
             try:
                 if magic in (0, 1):
                     raw_data = gzip.decompress(data) if magic == 1 else data
+                    logger.debug(f"Frame magic={magic} raw_len={len(raw_data)} hex_head={raw_data[:40].hex()}")
                     response = pb.StreamUnifiedChatWithToolsResponse()
                     response.ParseFromString(raw_data)
 
@@ -78,12 +83,21 @@ class ProtobufFrameParser:
                         if msg.content:
                             text_parts.append(msg.content)
 
+                    frame_tcs = extract_tool_calls_from_frame(raw_data)
+                    if frame_tcs:
+                        logger.info(f"Found {len(frame_tcs)} tool call(s) in frame")
+                    for tc in frame_tcs:
+                        logger.info(f"  TC: enum={tc.enum} id={tc.tool_call_id} name={tc.name} args_len={len(tc.raw_args)}")
+                        if tc.tool_call_id not in seen_tc_ids:
+                            seen_tc_ids.add(tc.tool_call_id)
+                            tool_calls.append(tc)
+
                 elif magic in (2, 3):
                     raw_data = gzip.decompress(data) if magic == 3 else data
                     utf8 = raw_data.decode("utf-8", errors="replace")
 
                     if utf8 and utf8 not in ("{}", "null"):
-                        logger.warning("Cursor error frame: %s", utf8[:500])
+                        logger.warn(f"Cursor error frame: {utf8[:500]}")
                         try:
                             err_obj = json.loads(utf8)
                             detail = (
@@ -103,12 +117,13 @@ class ProtobufFrameParser:
                             errors.append(ParsedError(raw=utf8, detail=utf8))
 
             except Exception as exc:
-                logger.warning("Frame decode error: %s", exc)
+                logger.warn(f"Frame decode error: {exc}")
 
         return ParseResult(
             thinking="".join(thinking_parts),
             text="".join(text_parts),
             errors=errors,
+            tool_calls=tool_calls,
         )
 
 

@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 Cursor protobuf request body builder & x-cursor-checksum generator.
 
@@ -8,12 +9,9 @@ validates on every request.
 Port of: cursor_protobuf_request_body_builder_and_checksum_generator.js
 """
 
-from __future__ import annotations
-
 import base64
 import gzip
 import hashlib
-import logging
 import re
 import struct
 import time
@@ -22,7 +20,9 @@ from uuid import uuid4
 
 from proto import cursor_api_pb2 as pb
 
-logger = logging.getLogger(__name__)
+from utils.structured_logging import ThalamusStructuredLogger
+
+logger = ThalamusStructuredLogger.get_logger("protobuf-builder", "DEBUG")
 
 
 # ---------------------------------------------------------------------------
@@ -157,6 +157,10 @@ def build_gzip_framed_protobuf_chat_request_body(
     ).replace("+00:00", "Z")
 
     r.unknown27 = 1 if agent_mode else 0
+
+    if agent_mode:
+        for tid in (19, 44, 45, 49):
+            r.supportedTools.append(tid)
 
     for mid in message_ids:
         proto_mid = r.messageIds.add()
