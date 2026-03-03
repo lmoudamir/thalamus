@@ -572,13 +572,14 @@ async def consume_stream(
                     on_tool_call(tc)
 
         if got_tool_call:
-            errors = [
-                e for e in errors
-                if not (hasattr(e, "error_code") and e.error_code == CURSOR_ABORT_ERROR_CODE)
-            ]
             has_fatal_error = False
             logger.info(f"[consume] Breaking stream after tool call (chunks={chunk_count}, text_len={len(text)})")
             break
+
+    errors = [
+        e for e in errors
+        if not (hasattr(e, "error_code") and e.error_code == CURSOR_ABORT_ERROR_CODE)
+    ]
 
     return {
         "text": text,

@@ -95,11 +95,12 @@ def _coerce_param_types(args: dict) -> dict:
 
 
 def _parse_query_string_lenient(qs: str) -> dict:
-    """Parse query string with minimal decoding to preserve file paths.
+    """Parse query string with full decoding including + → space.
 
-    Only splits on unencoded & and =. Decodes %0A→newline, %26→&, %3D→=, %20→space.
-    Leaves other percent-encoded sequences as-is to avoid mangling paths.
+    Handles standard application/x-www-form-urlencoded where + means space.
+    Uses unquote_plus for comprehensive decoding.
     """
+    from urllib.parse import unquote_plus
     args: dict[str, str] = {}
     if not qs:
         return args
@@ -109,10 +110,7 @@ def _parse_query_string_lenient(qs: str) -> dict:
             continue
         key = pair[:eq_idx]
         val = pair[eq_idx + 1:]
-        val = val.replace("%0A", "\n").replace("%0a", "\n")
-        val = val.replace("%20", " ")
-        val = val.replace("%26", "&").replace("%3D", "=").replace("%3d", "=")
-        val = unquote(val)
+        val = unquote_plus(val)
         args[key] = val
     return args
 
