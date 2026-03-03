@@ -1,0 +1,305 @@
+syntax = "proto3";
+
+message AvailableModelsResponse { 
+  message AvailableModel {
+    string name = 1;
+    bool defaultOn = 2;
+    optional bool isLongContextOnly = 3;
+    optional bool isChatOnly = 4;
+  }
+  repeated AvailableModel models = 2;
+  repeated string modelNames = 1;
+}
+
+message MessageSummary {
+  string content = 1;
+  string summaryId1 = 2; 
+  string summaryId2 = 3; // uuid, equal to summaryId1
+  string previousSummaryId = 4; 
+}
+
+message MessageThinking {
+  string content = 1;
+}
+message StreamUnifiedChatWithToolsRequest {
+  message Request {
+    message Message {
+      message Image {
+        message Metadata {
+          int32 width = 1;
+          int32 height = 2;
+        }
+        bytes data = 1;
+        Metadata metadata = 2;
+      }
+      string content = 1;
+      int32 role = 2;
+      Image image = 10;
+      string messageId = 13;
+      string unknown29 = 29; // 1, only for user message
+      string summaryId = 32;
+      MessageSummary summary = 39;
+      MessageThinking thinking = 45;
+      int32 chatModeEnum = 47; // 1 for ask, 2 for agent, 3 for edit
+    }
+    message Instruction {
+      string instruction = 1;
+    }
+    message Model {
+      string name = 1;
+      bytes empty = 4;
+    }
+    message CursorSetting {
+      message Unknown6 {
+        bytes unknown1 = 1;
+        bytes unknown2 = 2;
+      }
+      string name = 1;
+      bytes unknown3 = 3;
+      Unknown6 unknown6 = 6;
+      int32 unknown8 = 8;
+      int32 unknown9 = 9;
+    }
+    message Metadata {
+      string os = 1; // win32
+      string arch = 2; // x64
+      string version = 3; // 10.0.22631
+      string path = 4; // C:\Program Files\PowerShell\7\pwsh.exe
+      string timestamp = 5; // 2025-03-03T13:10:08.590Z
+    }
+    message MessageId {
+      string messageId = 1;
+      string summaryId = 2;
+      int32 role = 3;
+    }
+
+    repeated Message messages = 1;
+    int32 unknown2 = 2; // 1
+    Instruction instruction = 3;
+    int32 unknown4 = 4; // 1
+    Model model = 5;
+    repeated string wikiTool = 7; // one url one item
+    string webTool = 8; // "full search"
+    int32 unknown13 = 13;
+    CursorSetting cursorSetting = 15;
+    int32 unknown19 = 19; // 1
+    int32 unknown22 = 22; // 1
+    string conversationId = 23; // uuid
+    Metadata metadata = 26;
+    int32 unknown27 = 27; // 1 for is_agentic
+    repeated int32 supportedTools = 29; // ClientSideToolV2 enum values for agent mode
+    repeated MessageId messageIds = 30;
+    int32 largeContext = 35; // 1
+    int32 unknown38 = 38; // 0
+    int32 chatModeEnum = 46; // 1 for ask, 2 for agent, 3 for edit
+    string unknown47 = 47; 
+    int32 unknown48 = 48; // 0
+    int32 unknown49 = 49; // 0
+    int32 unknown51 = 51; // 0
+    int32 unknown53 = 53; // 0
+    string chatMode = 54;
+  }
+  
+  Request request = 1;
+}
+
+message StreamUnifiedChatWithToolsResponse {
+  message Message {
+    message WebTool {
+      message WebPage {
+        string url = 1;
+        string title = 2;
+        string content = 3;
+      }
+      repeated WebPage webPage = 1;
+    }
+    message Unknown12 {
+      message Content {
+        string content = 1;
+      }
+      Content content = 1;
+    }
+    string content = 1;
+    WebTool webtool = 11;
+    Unknown12 unknown12 = 12;
+    string unknown22 = 22; // uuid
+    string unknown23 = 23;
+    string unknown27 = 27; // uuid
+    MessageThinking thinking = 25;
+  }
+
+  Message message = 2;
+  MessageSummary summary = 3;
+}
+
+
+// ============================================================
+// StreamChatToolformer — Cursor's native tool calling RPC
+// Source: cursor-rpc (github.com/everestmz/cursor-rpc)
+// ============================================================
+
+enum BuiltinTool {
+  BUILTIN_TOOL_UNSPECIFIED = 0;
+  BUILTIN_TOOL_SEARCH = 1;
+  BUILTIN_TOOL_READ_CHUNK = 2;
+  BUILTIN_TOOL_GOTODEF = 3;
+  BUILTIN_TOOL_FIND_USAGES = 4;
+  BUILTIN_TOOL_CODEMOD = 5;
+  BUILTIN_TOOL_DIAGNOSTICS = 6;
+  BUILTIN_TOOL_TERMINAL = 7;
+  BUILTIN_TOOL_SEARCH_WEB = 8;
+  BUILTIN_TOOL_UI_STEP = 9;
+  BUILTIN_TOOL_FILE_SEARCH = 10;
+  BUILTIN_TOOL_EDIT_FILE = 11;
+  BUILTIN_TOOL_LIST_DIR = 12;
+  BUILTIN_TOOL_READ_FILE = 13;
+  BUILTIN_TOOL_SEMANTIC_SEARCH_FULL = 14;
+  BUILTIN_TOOL_CREATE_FILE = 15;
+  BUILTIN_TOOL_DELETE_FILE = 16;
+}
+
+message ModelDetails {
+  optional string modelName = 1;
+  optional string apiKey = 2;
+  optional bool enableGhostMode = 3;
+  optional bool enableSlowPool = 5;
+  optional string openaiApiBaseUrl = 6;
+}
+
+message RepositoryInfo {
+  string relativeWorkspacePath = 1;
+  repeated string remoteUrls = 2;
+  repeated string remoteNames = 3;
+  string repoName = 4;
+  string repoOwner = 5;
+  bool isTracked = 6;
+  bool isLocal = 7;
+}
+
+message ToolformerConversationMessage {
+  enum MessageType {
+    MESSAGE_TYPE_UNSPECIFIED = 0;
+    MESSAGE_TYPE_HUMAN = 1;
+    MESSAGE_TYPE_AI = 2;
+  }
+  string text = 1;
+  MessageType type = 2;
+  repeated ToolformerToolResult toolResults = 18;
+  bool isAgentic = 29;
+}
+
+message ToolformerToolResult {
+  string toolCallId = 1;
+  string toolName = 2;
+  uint32 toolIndex = 3;
+  string args = 4;
+  string rawArgs = 5;
+  optional string content = 7;
+  optional ToolResultError error = 9;
+}
+
+message ToolResultError {
+  string clientVisibleErrorMessage = 1;
+  string modelVisibleErrorMessage = 2;
+}
+
+message ToolCallCapability {
+  message ToolSchema {
+    enum ToolType {
+      TOOL_TYPE_UNSPECIFIED = 0;
+      TOOL_TYPE_ADD_FILE_TO_CONTEXT = 1;
+      TOOL_TYPE_RUN_TERMINAL_COMMAND = 2;
+      TOOL_TYPE_EDIT_FILE = 3;
+      TOOL_TYPE_REMOVE_FILE_FROM_CONTEXT = 4;
+      TOOL_TYPE_SEMANTIC_SEARCH_CODEBASE = 5;
+    }
+    ToolType type = 1;
+    string name = 2;
+    repeated string required = 4;
+  }
+  optional string customInstructions = 1;
+  repeated ToolSchema toolSchemas = 2;
+  repeated string relevantFiles = 3;
+  repeated string filesInContext = 4;
+  repeated string semanticSearchFiles = 5;
+}
+
+message ComposerCapabilityRequest {
+  ToolCallCapability toolCall = 6;
+}
+
+message GetChatRequest {
+  repeated ToolformerConversationMessage conversation = 2;
+  optional string workspaceRootPath = 5;
+  ModelDetails modelDetails = 7;
+  string requestId = 9;
+  string conversationId = 15;
+  optional bool isComposer = 27;
+  repeated ComposerCapabilityRequest capabilities = 21;
+}
+
+message ToolCall {
+  BuiltinToolCall builtinToolCall = 1;
+  CustomToolCall customToolCall = 2;
+}
+
+message BuiltinToolCall {
+  BuiltinTool tool = 1;
+  optional string toolCallId = 22;
+  // Params vary per tool type; we capture the raw bytes for now
+  string searchQuery = 2;
+  string readFilePath = 13;
+  string editFilePath = 14;
+  string terminalCommand = 7;
+  string createFilePath = 25;
+  string deleteFilePath = 26;
+  string listDirPath = 12;
+}
+
+message CustomToolCall {
+  string toolId = 1;
+  string params = 2;
+}
+
+message StreamChatToolformerResponse {
+  message Output {
+    string text = 1;
+  }
+  message ToolAction {
+    string userFacingText = 1;
+    string rawModelOutput = 3;
+    ToolCall toolCall = 2;
+    bool moreToCome = 4;
+  }
+  message Thought {
+    string text = 1;
+  }
+  optional string toolformerSessionId = 1;
+  Output output = 2;
+  ToolAction toolAction = 3;
+  Thought thought = 4;
+}
+
+message ToolResult {
+  BuiltinToolResult builtinToolResult = 1;
+  CustomToolResult customToolResult = 2;
+  ErrorToolResult errorToolResult = 3;
+}
+
+message BuiltinToolResult {
+  BuiltinTool tool = 1;
+}
+
+message CustomToolResult {
+  string toolId = 1;
+  string result = 2;
+}
+
+message ErrorToolResult {
+  string errorMessage = 1;
+}
+
+message StreamChatToolformerContinueRequest {
+  string toolformerSessionId = 1;
+  ToolResult toolResult = 2;
+}
