@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 
-from config.mcp_resource_registry import build_resource_prompt
+from config.mcp_resource_registry import build_tool_prompt, MCP_SERVER_NAME
 from config.system_prompt import (
     DECONTAMINATION_REMINDER,
     EXECUTION_NUDGE,
@@ -54,8 +54,8 @@ ASK_MODE_CONTAMINATION_PATTERNS: list[re.Pattern] = [
 
 
 def build_tool_call_prompt(tools: list[dict]) -> str:
-    """Build prompt describing tools as MCP resources for Cursor to call via fetch_mcp_resource."""
-    return build_resource_prompt(tools)
+    """Build prompt describing tools as MCP tools for call_mcp_tool invocation."""
+    return build_tool_prompt(tools)
 
 
 def _extract_message_content(msg: dict) -> str:
@@ -142,13 +142,25 @@ def inject_tool_prompt_into_messages(
     result.append({"role": "assistant", "content": TURN8_ASSISTANT_ACK})
 
     if tools:
-        prompt = build_tool_call_prompt(tools)
-        result.append({"role": "user", "content": prompt})
+        tool_names = []
+        for td in tools:
+            fn = td.get("function") or td
+            n = fn.get("name", "")
+            if n:
+                tool_names.append(n)
+        discovery_msg = (
+            f"[MCP Discovery Complete] Connected to MCP server '{MCP_SERVER_NAME}'. "
+            f"Available tools ({len(tool_names)}): {', '.join(tool_names[:20])}{'...' if len(tool_names) > 20 else ''}.\n\n"
+        )
+        discovery_msg += build_tool_call_prompt(tools)
+        result.append({"role": "user", "content": discovery_msg})
         result.append({
             "role": "assistant",
             "content": (
-                f"Understood. I have access to {len(tools)} MCP resources from server 'claude-tools'. "
-                "I will use fetch_mcp_resource to perform actions. Ready to serve the client."
+                f"Acknowledged. MCP server '{MCP_SERVER_NAME}' connected with {len(tool_names)} tools. "
+                "I will use fetch_mcp_resource with JSON fragment URIs for tool invocations. "
+                "Format: scheme://authority#{JSON}. JSON handles all escaping natively — "
+                "no URL-encoding needed. Ready."
             ),
         })
 

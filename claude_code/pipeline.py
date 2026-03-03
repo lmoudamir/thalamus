@@ -36,7 +36,7 @@ from core.protobuf_builder import (
     compute_sha256_hex_digest,
     generate_obfuscated_machine_id_checksum,
 )
-from config.mcp_resource_registry import parse_resource_uri
+from config.mcp_resource_registry import parse_resource_uri, _normalize_param_names
 from core.protobuf_frame_parser import CURSOR_ABORT_ERROR_CODE, ProtobufFrameParser
 from core.protobuf_tool_call_parser import ToolCall
 from core.cursor_h2_client import open_streaming_h2_request
@@ -562,7 +562,7 @@ async def consume_stream(
             logger.debug(f"[consume] text so far ({len(text)} chars): ...{text[-200:]}")
 
         for tc in result.tool_calls:
-            logger.info(f"[consume] TOOL CALL detected: enum={tc.enum} id={tc.tool_call_id} name={tc.name}")
+            logger.info(f"[consume] TOOL CALL detected: enum={tc.enum} id={tc.tool_call_id} name={tc.name} args_len={len(tc.raw_args)}")
             if tc.tool_call_id not in seen_tc_ids:
                 seen_tc_ids.add(tc.tool_call_id)
                 proto_tool_calls.append(tc)
@@ -955,14 +955,62 @@ def _fix_garbled_paths_in_tool_calls(tool_calls: list[dict]) -> list[dict]:
 
 
 def _convert_proto_tool_calls_to_anthropic(proto_tcs: list[ToolCall]) -> list[dict]:
-    """Convert protobuf ToolCall objects (from MCP resource URIs) to Anthropic tool_use format."""
+    """Convert protobuf ToolCall objects to Anthropic tool_use format.
+
+    Handles two paths:
+      enum=49 (call_mcp_tool): structured JSON args with toolName + arguments
+      enum=45 (fetch_mcp_resource): URI-based args (legacy fallback)
+    """
     result = []
     for tc in proto_tcs:
-        logger.debug(
+        logger.info(
             f"[convert] TC enum={tc.enum} id={tc.tool_call_id} name={tc.name} "
-            f"raw_args({len(tc.raw_args)})={tc.raw_args[:300]} "
+            f"raw_args({len(tc.raw_args)})={tc.raw_args[:500]} "
             f"args_keys={list(tc.args.keys()) if tc.args else 'EMPTY'}"
         )
+
+        if tc.enum == 49:
+            tool_name = (
+                tc.args.get("toolName")
+                or tc.args.get("tool_name")
+                or tc.args.get("name")
+                or ""
+            )
+            arguments = tc.args.get("arguments") or tc.args.get("params") or {}
+            if isinstance(arguments, str):
+                try:
+                    arguments = json.loads(arguments)
+                except (json.JSONDecodeError, ValueError):
+                    logger.warn(f"[convert] enum=49 arguments is non-JSON string: {arguments[:200]}")
+                    arguments = {}
+            if not isinstance(arguments, dict):
+                arguments = {}
+
+            if tool_name and arguments:
+                arguments = _normalize_param_names(tool_name, arguments)
+                logger.info(f"[convert] enum=49 call_mcp_tool: {tool_name} args_keys={list(arguments.keys())}")
+                result.append({
+                    "id": tc.tool_call_id,
+                    "type": "function",
+                    "function": {
+                        "name": tool_name,
+                        "arguments": json.dumps(arguments),
+                    },
+                })
+                continue
+            elif tool_name and not arguments:
+                logger.info(f"[convert] enum=49 call_mcp_tool: {tool_name} with no arguments (parameterless tool)")
+                result.append({
+                    "id": tc.tool_call_id,
+                    "type": "function",
+                    "function": {
+                        "name": tool_name,
+                        "arguments": "{}",
+                    },
+                })
+                continue
+            else:
+                logger.warn(f"[convert] enum=49 but no toolName found in args: {tc.args}")
 
         if tc.enum == 45:
             uri = tc.args.get("uri") or tc.raw_args
@@ -980,10 +1028,11 @@ def _convert_proto_tool_calls_to_anthropic(proto_tcs: list[ToolCall]) -> list[di
                     })
                     continue
                 elif tool_name and not tool_args:
-                    logger.warn(f"[convert] Skipping tool call {tool_name} with empty args (URI fragment missing or empty)")
+                    logger.warn(f"[convert] enum=45 skipping {tool_name} with empty args")
                     continue
 
         if tc.name and tc.args:
+            logger.debug(f"[convert] Generic fallback: name={tc.name}")
             result.append({
                 "id": tc.tool_call_id,
                 "type": "function",

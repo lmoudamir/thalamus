@@ -26,6 +26,8 @@ class ToolCall:
     name: str
     raw_args: str
     args: dict
+    is_streaming: bool = False
+    is_last: bool = True
 
 
 def _decode_varint(buf: bytes, pos: int) -> tuple[int, int]:
@@ -96,6 +98,8 @@ def _extract_tool_calls_recursive(data: bytes, depth: int = 0) -> list[ToolCall]
     tc_id = ""
     tc_name = ""
     tc_raw_args = ""
+    tc_streaming = False
+    tc_last = False
 
     for field_num, entries in fields.items():
         for wtype, val in entries:
@@ -113,26 +117,30 @@ def _extract_tool_calls_recursive(data: bytes, depth: int = 0) -> list[ToolCall]
                 s = _try_decode_utf8(val)
                 if s:
                     tc_raw_args = s
+            elif field_num == 14 and wtype == "varint":
+                tc_streaming = bool(val)
+            elif field_num == 15 and wtype == "varint":
+                tc_last = bool(val)
 
     if tc_enum > 0 and tc_id and tc_raw_args:
         if "\n" in tc_id:
             tc_id = tc_id.split("\n")[0]
         args = {}
-        json_valid = False
         try:
             parsed = json.loads(tc_raw_args)
             if isinstance(parsed, dict):
                 args = parsed
-                json_valid = True
         except (json.JSONDecodeError, ValueError):
             pass
-        if json_valid:
+        if args:
             results.append(ToolCall(
                 enum=tc_enum,
                 tool_call_id=tc_id,
                 name=tc_name,
                 raw_args=tc_raw_args,
                 args=args,
+                is_streaming=tc_streaming,
+                is_last=tc_last,
             ))
 
     for field_num, entries in fields.items():
