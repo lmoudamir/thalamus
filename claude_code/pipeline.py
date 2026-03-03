@@ -37,7 +37,7 @@ from core.protobuf_builder import (
     generate_obfuscated_machine_id_checksum,
 )
 from config.mcp_resource_registry import parse_resource_uri
-from core.protobuf_frame_parser import ProtobufFrameParser
+from core.protobuf_frame_parser import CURSOR_ABORT_ERROR_CODE, ProtobufFrameParser
 from core.protobuf_tool_call_parser import ToolCall
 from core.cursor_h2_client import open_streaming_h2_request
 from claude_code.tool_prompt_builder import (
@@ -574,11 +574,10 @@ async def consume_stream(
         if got_tool_call:
             errors = [
                 e for e in errors
-                if not (hasattr(e, "detail") and "Tool call ended" in str(e.detail))
+                if not (hasattr(e, "error_code") and e.error_code == CURSOR_ABORT_ERROR_CODE)
             ]
-            text = ""
             has_fatal_error = False
-            logger.info(f"[consume] Breaking stream after tool call (chunks={chunk_count})")
+            logger.info(f"[consume] Breaking stream after tool call (chunks={chunk_count}, text_len={len(text)})")
             break
 
     return {
@@ -765,10 +764,9 @@ async def _call_cursor_direct(
             raw_names = [(tc.get("function") or {}).get("name", "?") for tc in converted_tcs]
             logger.info(f"[{request_id}] Tool calls: {json.dumps([{'name': n} for n in raw_names])}")
 
-            text_before = consumed["text"] if not proto_tcs else ""
             return {
                 "tool_calls": converted_tcs,
-                "text": text_before,
+                "text": consumed["text"],
                 "thinking": consumed["thinking"],
                 "model": current_model,
                 "stats": {"passed": len(converted_tcs), "normalized": 0, "filtered": 0, "invalid_arguments_filtered": 0},
@@ -776,9 +774,6 @@ async def _call_cursor_direct(
             }
 
         final_text = consumed["text"]
-        if "Tool call ended before result was received" in final_text:
-            final_text = final_text.replace("[Error] Tool call ended before result was received", "").strip()
-            logger.info(f"[{request_id}] Filtered Cursor abort text from response")
         logger.info(
             f"[{request_id}] Text response (no tool calls) | len={len(final_text)} | {(time.monotonic() - start_time) * 1000:.0f}ms"
         )
@@ -1130,12 +1125,8 @@ async def run_claude_messages_pipeline(
             limiter = _OutputLimiter(max_tokens)
             sse_queue: asyncio.Queue[str | None] = asyncio.Queue()
 
-            _CURSOR_ABORT_TEXT = "Tool call ended before result was received"
-
             def on_text_delta(delta: str) -> None:
                 if not delta:
-                    return
-                if _CURSOR_ABORT_TEXT in delta or delta.strip().startswith("[Error]"):
                     return
                 limited = limiter.emit_within_limit(delta)
                 if limited:

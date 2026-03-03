@@ -94,8 +94,9 @@ echo "PID=$! at $(date +%T)"
 | 11 | heredoc 换行后路径正则匹配不到 | ✅ 已修 | 新增 `(?<=\n)(/[^\s"']+)` 正则模式 |
 | 12 | `claude -p` 无 stdin 管道时挂住 | 🔧 绕过 | 使用 `echo "" \| claude -p` 管道 stdin |
 | 13 | Bash 命令中 `!` 被 Claude Code zsh eval 转义 | ⚠️ 已知 | Claude Code 内部 eval 机制导致 `!` → `\!`，非 thalamus 问题 |
+| 14 | `ERROR_USER_ABORTED_REQUEST` abort error 污染 text | ✅ 已修 | **根因**: parser 将 Cursor 的正常 end-of-stream 信号混入 `text_parts`，导致 4 处分散过滤 hack。**修复**: parser 层根据 `error_code` 精确分类，abort error 不再混入 text；consume_stream 按 error_code 而非字符串匹配过滤；删除 streaming/non-streaming 的 3 处宽泛文本过滤 hack |
 
 ---
 
 ## 上次测试时间
-2026-03-03 19:01 (Level 6+7 通过 — 错误恢复 + Glob+Read(offset/limit)+Write 全链路)
+2026-03-03 19:12 (修复 ERROR_USER_ABORTED_REQUEST abort error 处理 — L1-L7 全链路回归通过)

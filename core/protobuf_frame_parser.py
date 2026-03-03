@@ -25,6 +25,8 @@ from utils.structured_logging import ThalamusStructuredLogger
 
 logger = ThalamusStructuredLogger.get_logger("protobuf-parser", "DEBUG")
 
+CURSOR_ABORT_ERROR_CODE = "ERROR_USER_ABORTED_REQUEST"
+
 
 @dataclass
 class ParsedError:
@@ -97,22 +99,27 @@ class ProtobufFrameParser:
                     utf8 = raw_data.decode("utf-8", errors="replace")
 
                     if utf8 and utf8 not in ("{}", "null"):
-                        logger.warn(f"Cursor error frame: {utf8[:500]}")
                         try:
                             err_obj = json.loads(utf8)
+                            error_code = _deep_get(err_obj, "error", "details", 0, "debug", "error")
                             detail = (
                                 _deep_get(err_obj, "error", "details", 0, "debug", "details", "detail")
                                 or _deep_get(err_obj, "error", "message")
                                 or utf8
                             )
+                            is_abort = error_code == CURSOR_ABORT_ERROR_CODE
+                            log_fn = logger.debug if is_abort else logger.warn
+                            log_fn(f"Cursor error frame: code={error_code} detail={detail[:200]}")
                             errors.append(ParsedError(
                                 raw=utf8,
                                 parsed=err_obj,
                                 detail=detail,
-                                error_code=_deep_get(err_obj, "error", "details", 0, "debug", "error"),
+                                error_code=error_code,
                             ))
-                            text_parts.append(f"[Error] {detail}")
+                            if not is_abort:
+                                text_parts.append(f"[Error] {detail}")
                         except (json.JSONDecodeError, ValueError):
+                            logger.warn(f"Cursor error frame (unparseable): {utf8[:300]}")
                             text_parts.append(f"[Error] {utf8}")
                             errors.append(ParsedError(raw=utf8, detail=utf8))
 
