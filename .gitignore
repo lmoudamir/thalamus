@@ -3,7 +3,7 @@ __pycache__/
 *.so
 .venv/
 venv/
-.env
+.env.local
 *.egg-info/
 dist/
 build/
