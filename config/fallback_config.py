@@ -173,6 +173,24 @@ _DEFAULT_FALLBACK_CHAINS = {
     'composer-1.5': ['default'],
     'default': [],
 
+    # --- fast virtual model: speed-optimized chain (benchmarked 4 rounds) ---
+    # Priority: fastest first, then stable fallbacks, then last-resort
+    # S-tier (avg <2s): spark-preview, spark-preview-low
+    # A-tier (avg 3-4s, 100% stable): spark-preview-xhigh, 5.4-medium-fast, 5.2-fast
+    # B-tier (avg 3s, 75% stable): 5.2-low-fast
+    # C-tier (avg 7s, 100% stable): 5-mini
+    'fast': [
+        'gpt-5.3-codex-spark-preview',
+        'gpt-5.3-codex-spark-preview-low',
+        'gpt-5.3-codex-spark-preview-xhigh',
+        'gpt-5.4-medium-fast',
+        'gpt-5.2-fast',
+        'gpt-5.2-low-fast',
+        'gpt-5-mini',
+        'composer-1.5',
+        'default',
+    ],
+
     # --- thalamus virtual model: full 22-stop chain ---
     'thalamus': [
         'gemini-3.1-pro', 'gemini-3-pro', 'claude-4.5-sonnet-thinking',
