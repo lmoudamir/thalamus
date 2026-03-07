@@ -94,6 +94,14 @@ class StreamingAnthropicSession:
     def emit_text_delta(self, text: str) -> str:
         out: list[str] = []
         if not self.text_open:
+            if self.thinking_open:
+                out.append(
+                    self._format(
+                        "content_block_stop",
+                        {"type": "content_block_stop", "index": self.thinking_index},
+                    )
+                )
+                self.thinking_open = False
             self.text_index = self.block_index
             self.block_index += 1
             self.text_open = True

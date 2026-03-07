@@ -69,59 +69,121 @@ _DEFAULT_ERROR_PATTERNS = [
 ]
 
 _DEFAULT_FALLBACK_CHAINS = {
-    'gpt-5.3-codex-spark-preview': [
-        'gpt-5.3-codex-spark-preview-high',
-        'gpt-5.3-codex-spark-preview-low',
-        'claude-4.5-haiku',
-        'gemini-3-flash',
-        'default',
+    # --- Tier 1: top-tier ---
+    'gemini-3.1-pro': [
+        'gemini-3-pro', 'claude-4.5-sonnet', 'gpt-5.3-codex-spark-preview-high',
+        'claude-4-sonnet', 'claude-4.5-haiku', 'gemini-3-flash',
+        'grok-code-fast-1', 'composer-1.5', 'default',
     ],
-    'gpt-5.3-codex-spark-preview-high': [
-        'gpt-5.3-codex-spark-preview',
-        'gpt-5.3-codex-spark-preview-low',
-        'claude-4.5-haiku',
-        'gemini-3-flash',
-        'default',
+    'gemini-3-pro': [
+        'claude-4.5-sonnet', 'gpt-5.3-codex-spark-preview-high',
+        'claude-4-sonnet', 'claude-4.5-haiku', 'gemini-3-flash',
+        'grok-code-fast-1', 'composer-1.5', 'default',
     ],
-    'gpt-5.3-codex-spark-preview-low': [
-        'gpt-5.3-codex-spark-preview',
-        'claude-4.5-haiku',
-        'gemini-3-flash',
-        'default',
+    'claude-4.5-sonnet-thinking': [
+        'claude-4.5-sonnet', 'gemini-3.1-pro', 'gemini-3-pro',
+        'gpt-5.3-codex-spark-preview-high', 'claude-4-sonnet',
+        'claude-4.5-haiku', 'gemini-3-flash', 'composer-1.5', 'default',
     ],
     'claude-4.5-sonnet': [
-        'claude-4.5-haiku',
-        'gpt-5.3-codex-spark-preview',
-        'gemini-3-flash',
-        'default',
+        'gemini-3.1-pro', 'gemini-3-pro', 'gpt-5.3-codex-spark-preview-high',
+        'claude-4-sonnet', 'claude-4.5-haiku', 'gemini-3-flash',
+        'grok-code-fast-1', 'composer-1.5', 'default',
     ],
     'claude-4.5-opus-high': [
-        'claude-4.5-sonnet',
-        'claude-4.5-haiku',
-        'gpt-5.3-codex-spark-preview',
-        'default',
+        'claude-4.5-sonnet', 'gemini-3.1-pro',
+        'gpt-5.3-codex-spark-preview-high', 'claude-4-sonnet',
+        'claude-4.5-haiku', 'gemini-3-flash', 'composer-1.5', 'default',
+    ],
+
+    # --- Tier 2: strong coding + fast ---
+    'gpt-5.3-codex-spark-preview-xhigh': [
+        'gpt-5.3-codex-spark-preview-high', 'gpt-5.3-codex-spark-preview',
+        'claude-4.5-sonnet', 'claude-4-sonnet', 'claude-4.5-haiku',
+        'gemini-3-flash', 'composer-1.5', 'default',
+    ],
+    'gpt-5.3-codex-spark-preview-high': [
+        'gpt-5.3-codex-spark-preview', 'claude-4.5-sonnet',
+        'claude-4-sonnet', 'claude-4.5-haiku', 'gemini-3-flash',
+        'grok-code-fast-1', 'composer-1.5', 'default',
+    ],
+    'gpt-5.3-codex-spark-preview': [
+        'gpt-5.3-codex-spark-preview-high', 'claude-4-sonnet',
+        'claude-4.5-haiku', 'gemini-3-flash', 'grok-code-fast-1',
+        'composer-1.5', 'default',
+    ],
+    'claude-4-sonnet-thinking': [
+        'claude-4-sonnet', 'claude-4.5-haiku', 'kimi-k2.5',
+        'gemini-3-flash', 'grok-code-fast-1', 'composer-1.5', 'default',
+    ],
+    'claude-4-sonnet': [
+        'kimi-k2.5', 'claude-4.5-haiku', 'gpt-5.1-codex-mini-high',
+        'gemini-3-flash', 'grok-code-fast-1', 'composer-1.5', 'default',
+    ],
+
+    # --- Tier 3: mid-performance ---
+    'kimi-k2.5': [
+        'gpt-5.1-codex-mini-high', 'gpt-5.1-codex-mini',
+        'claude-4.5-haiku', 'gemini-3-flash', 'grok-code-fast-1',
+        'gemini-2.5-flash', 'composer-1.5', 'default',
+    ],
+    'gpt-5.1-codex-mini-high': [
+        'gpt-5.1-codex-mini', 'claude-4.5-haiku', 'gemini-3-flash',
+        'grok-code-fast-1', 'gemini-2.5-flash', 'composer-1.5', 'default',
+    ],
+    'gpt-5.1-codex-mini': [
+        'claude-4.5-haiku', 'gemini-3-flash', 'grok-code-fast-1',
+        'gemini-2.5-flash', 'gpt-5-mini', 'composer-1.5', 'default',
+    ],
+    'claude-4.5-haiku-thinking': [
+        'claude-4.5-haiku', 'gemini-3-flash', 'grok-code-fast-1',
+        'gemini-2.5-flash', 'gpt-5-mini', 'composer-1.5', 'default',
     ],
     'claude-4.5-haiku': [
-        'gpt-5.3-codex-spark-preview',
-        'gemini-3-flash',
-        'default',
+        'gemini-3-flash', 'grok-code-fast-1', 'gemini-2.5-flash',
+        'gpt-5-mini', 'gpt-5.1-codex-mini-low', 'composer-1.5', 'default',
     ],
-    'gemini-3.1-pro': [
-        'claude-4.5-haiku',
-        'gpt-5.3-codex-spark-preview',
-        'gemini-3-flash',
-        'default',
-    ],
+
+    # --- Tier 4: fast & lightweight ---
     'gemini-3-flash': [
-        'claude-4.5-haiku',
-        'gpt-5.3-codex-spark-preview',
-        'default',
+        'grok-code-fast-1', 'gemini-2.5-flash', 'claude-4.5-haiku',
+        'gpt-5-mini', 'gpt-5.1-codex-mini-low', 'composer-1.5', 'default',
     ],
-    'default': [
-        'gpt-5.3-codex-spark-preview',
-        'claude-4.5-haiku',
-        'gemini-3-flash',
-        'default',
+    'grok-code-fast-1': [
+        'gemini-3-flash', 'gemini-2.5-flash', 'gpt-5-mini',
+        'gpt-5.3-codex-spark-preview-low', 'composer-1.5', 'default',
+    ],
+    'gemini-2.5-flash': [
+        'gemini-3-flash', 'grok-code-fast-1', 'gpt-5-mini',
+        'gpt-5.3-codex-spark-preview-low', 'composer-1.5', 'default',
+    ],
+    'gpt-5-mini': [
+        'gemini-3-flash', 'grok-code-fast-1', 'gemini-2.5-flash',
+        'gpt-5.3-codex-spark-preview-low', 'gpt-5.1-codex-mini-low',
+        'composer-1.5', 'default',
+    ],
+
+    # --- Fallback: last resort ---
+    'gpt-5.3-codex-spark-preview-low': [
+        'gpt-5.1-codex-mini-low', 'composer-1.5', 'default',
+    ],
+    'gpt-5.1-codex-mini-low': [
+        'composer-1.5', 'default',
+    ],
+    'composer-1.5': ['default'],
+    'default': [],
+
+    # --- thalamus virtual model: full 22-stop chain ---
+    'thalamus': [
+        'gemini-3.1-pro', 'gemini-3-pro', 'claude-4.5-sonnet-thinking',
+        'claude-4.5-sonnet', 'gpt-5.3-codex-spark-preview-xhigh',
+        'gpt-5.3-codex-spark-preview-high', 'gpt-5.3-codex-spark-preview',
+        'claude-4-sonnet-thinking', 'claude-4-sonnet', 'kimi-k2.5',
+        'gpt-5.1-codex-mini-high', 'gpt-5.1-codex-mini',
+        'claude-4.5-haiku-thinking', 'claude-4.5-haiku',
+        'gemini-3-flash', 'grok-code-fast-1', 'gemini-2.5-flash',
+        'gpt-5-mini', 'gpt-5.3-codex-spark-preview-low',
+        'gpt-5.1-codex-mini-low', 'composer-1.5', 'default',
     ],
 }
 

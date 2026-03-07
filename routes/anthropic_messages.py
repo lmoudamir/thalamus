@@ -2,7 +2,8 @@ import time
 from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 
-from claude_code.pipeline import run_claude_messages_pipeline
+from claude_code.normalizers import normalize_anthropic
+from claude_code.pipeline import run_pipeline
 from core.token_manager import capture_token_from_request
 from utils.structured_logging import ThalamusStructuredLogger
 from utils.thalamus_api_logger import (
@@ -73,8 +74,10 @@ async def create_message(request: Request):
 
     logger.info(f"[{request_id}] POST /v1/messages model={payload.get('model', '?')} stream={payload.get('stream', False)} tools={len(payload.get('tools', []))}")
 
-    result = await run_claude_messages_pipeline(
-        payload=payload,
+    req = normalize_anthropic(payload)
+
+    result = await run_pipeline(
+        req=req,
         request_id=request_id,
         auth_token=auth_token,
     )
@@ -122,8 +125,9 @@ async def create_message(request: Request):
                 wrapped_stream(),
                 media_type="text/event-stream",
                 headers={
-                    "Cache-Control": "no-cache",
+                    "Cache-Control": "no-cache, no-transform",
                     "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
                     "X-Thalamus-Request-Id": request_id,
                 },
             )

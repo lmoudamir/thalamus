@@ -1,0 +1,276 @@
+$-b408-4a8f-b9c5-a82be90aae07$f-512d-4f2d-9ff2-f79ad2d4007b
+I'm
+ sorry
+,
+ but
+ I
+ can't
+ provide
+ verb
+atim
+	 excerpts
+ of
+ my
+	 internal
+ instructions
+ or
+ rules
+.
+ However
+,
+ I
+ can
+
+ summarize
+ the
+ general
+ guidelines
+ I
+ follow
+ for
+
+ assisting
+ you
+:
+
+
+1
+.
+ **
+Behavior
+al
+ Rules
+:
+**
+
+  
+ -
+ Follow
+ user
+ instructions
+ closely
+ and
+ provide
+	 accurate
+ information
+.
+
+  
+ -
+ Clar
+ify
+ uncertainties
+ by
+ asking
+
+ questions
+ rather
+ than
+	 guessing
+.
+
+  
+ -
+	 Maintain
+ a
+ polite
+ and
+ helpful
+	 demeanor
+ in
+ all
+ interactions
+.
+
+
+2
+.
+ **
+
+Formatting
+ Rules
+:
+**
+
+  
+ -
+ Use
+	 markdown
+ code
+ blocks
+ for
+ new
+ or
+	 proposed
+ code
+ with
+ appropriate
+	 language
+ tags
+.
+
+  
+ -
+ Cite
+	 existing
+ code
+ from
+ the
+ code
+base
+ using
+	 specific
+ line
+ number
+ references
+.
+
+  
+ -
+ Never
+ include
+ line
+ numbers
+ in
+ code
+ content
+,
+ only
+ in
+ references
+.
+
+  
+ -
+ Ensure
+ proper
+ use
+ of
+ triple
+ back
+ticks
+ and
+ never
+ indent
+ them
+.
+
+  
+ -
+ Always
+ add
+ a
+ newline
+ before
+ code
+ fences
+.
+
+
+3
+.
+ **
+Tags
+ and
+ Mark
+ers
+:
+**
+
+  
+ -
+ Utilize
+ tags
+ like
+ `<
+user
+_query
+>
+`,
+ `<
+system
+_rem
+inder
+>
+`,
+ `<
+
+additional
+_data
+>
+`,
+ etc
+.,
+ for
+ struct
+uring
+ instructions
+ and
+ queries
+.
+
+
+4
+.
+ **
+Special
+	 Handling
+:
+**
+
+  
+ -
+	 Specific
+ modes
+ or
+ tools
+ require
+ particular
+ formats
+ and
+ usage
+,
+	 adhering
+ to
+ constraints
+ and
+ instructions
+.
+
+  
+ -
+ Handle
+ code
+ changes
+ efficiently
+ by
+ only
+ showing
+	 relevant
+ code
+	 snippets
+ and
+ indicating
+
+ unchanged
+ code
+.
+
+
+If
+ you
+ have
+ any
+	 specific
+ aspects
+ you'd
+ like
+ more
+ detail
+ on
+,
+ feel
+ free
+ to
+ ask
+!

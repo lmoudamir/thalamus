@@ -2,16 +2,12 @@ from __future__ import annotations
 """
 Main pipeline module — the heart of thalamus-py.
 
-Ports claude_messages_pipeline_service.js and claude_code_direct_cursor_api_caller.js
-into a single Python module.
-
-Pipeline flow:
-  1. Receive Anthropic Messages API request
-  2. Normalize to OpenAI format
-  3. Inject tool prompts
-  4. Call Cursor API via H2
-  5. Parse tool calls from text response
-  6. Assemble Anthropic SSE output
+Pipeline flow (format-agnostic):
+  1. Receive UnifiedRequest (from normalize_anthropic or normalize_openai)
+  2. Inject tool prompts
+  3. Call Cursor API via H2
+  4. Parse tool calls from text response
+  5. Assemble SSE output (Anthropic or OpenAI, chosen by original_format)
 """
 
 import asyncio
@@ -26,6 +22,7 @@ from utils.structured_logging import ThalamusStructuredLogger
 
 from core.token_manager import get_cursor_access_token
 from core.bearer_token import strip_cursor_user_prefix
+from core.unified_request import UnifiedRequest
 from utils.llm_payload_logger import (
     log_llm_request,
     log_llm_response,
@@ -36,18 +33,18 @@ from core.protobuf_builder import (
     compute_sha256_hex_digest,
     generate_obfuscated_machine_id_checksum,
 )
-from config.mcp_resource_registry import parse_resource_uri, _normalize_param_names
 from core.protobuf_frame_parser import CURSOR_ABORT_ERROR_CODE, ProtobufFrameParser
-from core.protobuf_tool_call_parser import ToolCall
 from core.cursor_h2_client import open_streaming_h2_request
-from claude_code.tool_prompt_builder import (
-    build_tool_call_prompt,
-    inject_tool_prompt_into_messages,
-)
+from claude_code.tool_prompt_builder import inject_tool_prompt_into_messages, build_tool_call_prompt
+from config.system_prompt import THALAMUS_INSTRUCTION_SUPPLEMENT
 from claude_code.tool_parser import try_parse_tool_calls_from_text
 from claude_code.sse_assembler import (
     StreamingAnthropicSession,
     build_unary_anthropic_response,
+)
+from claude_code.openai_sse_assembler import (
+    StreamingOpenAISession,
+    build_unary_openai_response,
 )
 from config.tool_registry import post_process_tool_calls
 from config.fallback_config import load_fallback_config
@@ -73,142 +70,6 @@ TOOL_JSON_START_MARKERS: list[str] = [
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-def normalize_content(content: Any) -> str:
-    """Flatten Anthropic content (string / list / dict) to plain text."""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: list[str] = []
-        for item in content:
-            if isinstance(item, str):
-                parts.append(item)
-            elif isinstance(item, dict):
-                raw = item.get("text") or item.get("content") or ""
-                parts.append(normalize_content(raw) if not isinstance(raw, str) else raw)
-            elif isinstance(item, list):
-                parts.append(normalize_content(item))
-        return " ".join(parts).strip()
-    if isinstance(content, dict):
-        raw = content.get("text") or content.get("content") or ""
-        return normalize_content(raw) if not isinstance(raw, str) else raw
-    return str(content) if content is not None else ""
-
-
-def _remove_uri_format(schema: Any) -> Any:
-    """Recursively strip format:'uri' from JSON-Schema nodes (Cursor rejects it)."""
-    if not schema or not isinstance(schema, dict):
-        return schema
-    if isinstance(schema, list):
-        return [_remove_uri_format(item) for item in schema]
-
-    if schema.get("type") == "string" and schema.get("format") == "uri":
-        return {k: v for k, v in schema.items() if k != "format"}
-
-    result: dict[str, Any] = {}
-    for key, value in schema.items():
-        if key == "properties" and isinstance(value, dict):
-            result[key] = {pk: _remove_uri_format(pv) for pk, pv in value.items()}
-        elif key in ("items", "additionalProperties") and isinstance(value, dict):
-            result[key] = _remove_uri_format(value)
-        elif key in ("anyOf", "allOf", "oneOf") and isinstance(value, list):
-            result[key] = [_remove_uri_format(item) for item in value]
-        else:
-            result[key] = _remove_uri_format(value)
-    return result
-
-
-def resolve_model_name(model_name: str) -> str:
-    """Map legacy Claude model names to current equivalents."""
-    resolved = model_name or "claude-4.5-sonnet"
-    lower = resolved.lower()
-
-    if "claude-3-5-sonnet" in lower or "claude-3.5-sonnet" in lower:
-        return "claude-4.5-sonnet"
-    if "claude-3-7-sonnet" in lower or "claude-3.7-sonnet" in lower:
-        return "claude-4.5-sonnet"
-    if "claude-3-opus" in lower or "claude-3.5-opus" in lower:
-        return "claude-4.5-opus-high"
-    if "claude-3-haiku" in lower or "claude-3.5-haiku" in lower:
-        return "claude-4.5-haiku"
-    return resolved
-
-
-def normalize_anthropic_payload(payload: dict) -> dict:
-    """Convert an Anthropic Messages API payload to internal (OpenAI-ish) format."""
-    messages: list[dict] = []
-
-    sys_content = payload.get("system")
-    if isinstance(sys_content, list):
-        for item in sys_content:
-            text = normalize_content(
-                item.get("text") or item.get("content") or item
-                if isinstance(item, dict) else item
-            )
-            if text:
-                messages.append({"role": "system", "content": text})
-    elif isinstance(sys_content, str) and sys_content:
-        messages.append({"role": "system", "content": sys_content})
-
-    for msg in payload.get("messages") or []:
-        parts = msg.get("content") if isinstance(msg.get("content"), list) else []
-
-        tool_calls = [
-            {
-                "type": "function",
-                "id": tc.get("id", ""),
-                "function": {
-                    "name": tc.get("name", ""),
-                    "arguments": json.dumps(tc.get("input") or {}),
-                },
-            }
-            for tc in parts
-            if isinstance(tc, dict) and tc.get("type") == "tool_use"
-        ]
-
-        normalized = normalize_content(msg.get("content"))
-        new_msg: dict[str, Any] = {"role": msg.get("role", "user")}
-        if normalized:
-            new_msg["content"] = normalized
-        if tool_calls:
-            new_msg["tool_calls"] = tool_calls
-        if new_msg.get("content") or new_msg.get("tool_calls"):
-            messages.append(new_msg)
-
-        for tr in parts:
-            if isinstance(tr, dict) and tr.get("type") == "tool_result":
-                messages.append({
-                    "role": "tool",
-                    "content": tr.get("text") or tr.get("content") or json.dumps(tr),
-                    "tool_call_id": tr.get("tool_use_id", ""),
-                })
-
-    tools = [
-        {
-            "type": "function",
-            "function": {
-                "name": t.get("name", ""),
-                "description": t.get("description", ""),
-                "parameters": _remove_uri_format(t.get("input_schema")),
-            },
-        }
-        for t in (payload.get("tools") or [])
-        if t.get("name") != "BatchTool"
-    ]
-
-    return {
-        "messages": messages,
-        "tools": tools,
-        "stream": payload.get("stream") is True,
-        "resolved_model": resolve_model_name(payload.get("model", "")),
-        "request_controls": {
-            "max_tokens": payload.get("max_tokens"),
-            "temperature": payload.get("temperature"),
-            "top_p": payload.get("top_p"),
-            "stop": payload.get("stop_sequences") or payload.get("stop"),
-        },
-    }
 
 
 def _to_api_error_body(message: str, error_type: str = "api_error") -> dict:
@@ -306,7 +167,7 @@ class ToolJsonAwareTextForwarder:
         self._pending_buffer = ""
         self._safe_text_consumed_len = 0
         self.stopped_due_to_tool_json = False
-        self._tail_buffer_len = 30
+        self._tail_buffer_len = 15
 
     def _process_safe_chunk(self, chunk: str) -> str | None:
         if not chunk:
@@ -500,24 +361,81 @@ def build_cursor_stream_params(
     return path, headers, body
 
 
+class _ThinkTagSplitter:
+    """Streaming splitter that separates <think>...</think> from regular text.
+
+    Some models (e.g. composer-1.5) embed thinking inside the text field
+    using <think> tags instead of the protobuf thinking field.  Claude Code
+    expects thinking to arrive as proper ``thinking_delta`` SSE events, not
+    as raw text — otherwise the response appears blank.
+    """
+
+    __slots__ = ("_inside_think", "_buf")
+
+    def __init__(self) -> None:
+        self._inside_think = False
+        self._buf = ""
+
+    def feed(self, chunk: str) -> tuple[str, str]:
+        """Return (thinking_part, text_part) extracted from *chunk*."""
+        self._buf += chunk
+        thinking_out: list[str] = []
+        text_out: list[str] = []
+
+        while self._buf:
+            if self._inside_think:
+                end = self._buf.find("</think>")
+                if end == -1:
+                    thinking_out.append(self._buf)
+                    self._buf = ""
+                else:
+                    thinking_out.append(self._buf[:end])
+                    self._buf = self._buf[end + len("</think>"):]
+                    self._inside_think = False
+            else:
+                start = self._buf.find("<think>")
+                if start == -1:
+                    if len(self._buf) >= 7:
+                        safe = len(self._buf) - 6
+                        text_out.append(self._buf[:safe])
+                        self._buf = self._buf[safe:]
+                    break
+                else:
+                    text_out.append(self._buf[:start])
+                    self._buf = self._buf[start + len("<think>"):]
+                    self._inside_think = True
+
+        return "".join(thinking_out), "".join(text_out)
+
+    def flush(self) -> tuple[str, str]:
+        """Flush any remaining buffered content."""
+        remaining = self._buf
+        self._buf = ""
+        if self._inside_think:
+            self._inside_think = False
+            return remaining, ""
+        return "", remaining
+
+
 async def consume_stream(
     stream_iterator: AsyncIterator[bytes],
     on_text_delta: Callable[[str], Any] | None = None,
     on_thinking_delta: Callable[[str], Any] | None = None,
-    on_tool_call: Callable[[ToolCall], Any] | None = None,
 ) -> dict:
-    """Consume a Cursor protobuf stream, accumulating text/thinking/errors/tool_calls.
+    """Consume a Cursor protobuf stream, accumulating text/thinking/errors.
 
-    When a tool call is detected, we break out of the stream immediately since
-    Cursor holds the connection open waiting for a tool result. The caller is
-    responsible for handling tool result return in a follow-up request.
+    Tool calls are extracted from text after the stream completes (prompt
+    injection approach), not from protobuf wire-level tool call fields.
+
+    Models that embed <think>...</think> in the text field (instead of the
+    protobuf thinking field) are handled transparently: the tags are stripped
+    and the content is routed to on_thinking_delta.
     """
     parser = ProtobufFrameParser()
+    splitter = _ThinkTagSplitter()
     text = ""
     thinking = ""
     errors: list[Any] = []
-    proto_tool_calls: list[ToolCall] = []
-    seen_tc_ids: set[str] = set()
     had_content = False
     has_fatal_error = False
     chunk_count = 0
@@ -525,7 +443,6 @@ async def consume_stream(
     thinking_delta_count = 0
     stream_start = time.monotonic()
     first_chunk_latency_ms: float | None = None
-    got_tool_call = False
 
     async for chunk in stream_iterator:
         chunk_count += 1
@@ -536,8 +453,7 @@ async def consume_stream(
         result = parser.parse(chunk)
         logger.debug(
             f"[consume] chunk#{chunk_count} parsed: text_len={len(result.text)} "
-            f"thinking_len={len(result.thinking)} tool_calls={len(result.tool_calls)} "
-            f"errors={len(result.errors)}"
+            f"thinking_len={len(result.thinking)} errors={len(result.errors)}"
         )
 
         if result.errors:
@@ -554,27 +470,36 @@ async def consume_stream(
                 on_thinking_delta(result.thinking)
 
         if result.text:
-            text += result.text
-            text_delta_count += 1
-            had_content = True
-            if on_text_delta:
-                on_text_delta(result.text)
-            logger.debug(f"[consume] text so far ({len(text)} chars): ...{text[-200:]}")
+            think_part, text_part = splitter.feed(result.text)
 
-        for tc in result.tool_calls:
-            logger.info(f"[consume] TOOL CALL detected: enum={tc.enum} id={tc.tool_call_id} name={tc.name} args_len={len(tc.raw_args)}")
-            if tc.tool_call_id not in seen_tc_ids:
-                seen_tc_ids.add(tc.tool_call_id)
-                proto_tool_calls.append(tc)
+            if think_part:
+                thinking += think_part
+                thinking_delta_count += 1
                 had_content = True
-                got_tool_call = True
-                if on_tool_call:
-                    on_tool_call(tc)
+                if on_thinking_delta:
+                    on_thinking_delta(think_part)
 
-        if got_tool_call:
-            has_fatal_error = False
-            logger.info(f"[consume] Breaking stream after tool call (chunks={chunk_count}, text_len={len(text)})")
-            break
+            if text_part:
+                text += text_part
+                text_delta_count += 1
+                had_content = True
+                if on_text_delta:
+                    on_text_delta(text_part)
+                logger.debug(f"[consume] text so far ({len(text)} chars): ...{text[-200:]}")
+
+    flush_think, flush_text = splitter.flush()
+    if flush_think:
+        thinking += flush_think
+        thinking_delta_count += 1
+        had_content = True
+        if on_thinking_delta:
+            on_thinking_delta(flush_think)
+    if flush_text:
+        text += flush_text
+        text_delta_count += 1
+        had_content = True
+        if on_text_delta:
+            on_text_delta(flush_text)
 
     errors = [
         e for e in errors
@@ -585,7 +510,6 @@ async def consume_stream(
         "text": text,
         "thinking": thinking,
         "errors": errors,
-        "proto_tool_calls": proto_tool_calls,
         "had_content": had_content,
         "has_fatal_error": has_fatal_error,
         "metrics": {
@@ -703,36 +627,22 @@ async def _call_cursor_direct(
             }
 
         metrics = consumed["metrics"]
-        proto_tcs = consumed.get("proto_tool_calls") or []
         attempt_latency = int((time.monotonic() - attempt_start) * 1000)
         logger.info(
             f"[{request_id}] Stream consumed | text_len={len(consumed['text'])} thinking_len={len(consumed['thinking'])} "
-            f"proto_tool_calls={len(proto_tcs)} errors={len(consumed['errors'])} "
+            f"errors={len(consumed['errors'])} "
             f"chunks={metrics['chunk_count']} first_token_ms={metrics['first_chunk_latency_ms']:.0f}"
         )
 
-        converted_tcs = _convert_proto_tool_calls_to_anthropic(proto_tcs) if proto_tcs else []
-        if converted_tcs:
-            converted_tcs = _fix_garbled_paths_in_tool_calls(converted_tcs)
-
-        if proto_tcs and not converted_tcs:
-            logger.warn(
-                f"[{request_id}] All {len(proto_tcs)} proto tool call(s) had incomplete args — retrying"
-            )
-            tried_models.append(current_model)
-            next_model = fallback_cfg.select_next_model(model, tried_models)
-            if next_model:
-                current_model = next_model
-            continue
-
-        if not converted_tcs and valid_tool_names:
-            converted_tcs_from_text = try_parse_tool_calls_from_text(consumed["text"])
-            if converted_tcs_from_text:
-                result = post_process_tool_calls(converted_tcs_from_text, valid_tool_names)
+        converted_tcs: list[dict] = []
+        if valid_tool_names:
+            parsed_tcs = try_parse_tool_calls_from_text(consumed["text"])
+            if parsed_tcs:
+                result = post_process_tool_calls(parsed_tcs, valid_tool_names)
                 converted_tcs = result.get("processed") or []
                 if converted_tcs:
                     converted_tcs = _fix_garbled_paths_in_tool_calls(converted_tcs)
-                logger.info(f"[{request_id}] Fallback text-parsed tool calls: {len(converted_tcs)}")
+                logger.info(f"[{request_id}] Text-parsed tool calls: {len(converted_tcs)}")
 
         res_payload_path = log_llm_response(
             request_id, current_model, consumed["text"],
@@ -742,7 +652,6 @@ async def _call_cursor_direct(
             extra={
                 "thinking_len": len(consumed["thinking"]),
                 "chunks": metrics["chunk_count"],
-                "proto_tool_calls": len(proto_tcs),
             },
         )
         log_llm_api_call(
@@ -954,95 +863,6 @@ def _fix_garbled_paths_in_tool_calls(tool_calls: list[dict]) -> list[dict]:
     return result
 
 
-def _convert_proto_tool_calls_to_anthropic(proto_tcs: list[ToolCall]) -> list[dict]:
-    """Convert protobuf ToolCall objects to Anthropic tool_use format.
-
-    Handles two paths:
-      enum=49 (call_mcp_tool): structured JSON args with toolName + arguments
-      enum=45 (fetch_mcp_resource): URI-based args (legacy fallback)
-    """
-    result = []
-    for tc in proto_tcs:
-        logger.info(
-            f"[convert] TC enum={tc.enum} id={tc.tool_call_id} name={tc.name} "
-            f"raw_args({len(tc.raw_args)})={tc.raw_args[:500]} "
-            f"args_keys={list(tc.args.keys()) if tc.args else 'EMPTY'}"
-        )
-
-        if tc.enum == 49:
-            tool_name = (
-                tc.args.get("toolName")
-                or tc.args.get("tool_name")
-                or tc.args.get("name")
-                or ""
-            )
-            arguments = tc.args.get("arguments") or tc.args.get("params") or {}
-            if isinstance(arguments, str):
-                try:
-                    arguments = json.loads(arguments)
-                except (json.JSONDecodeError, ValueError):
-                    logger.warn(f"[convert] enum=49 arguments is non-JSON string: {arguments[:200]}")
-                    arguments = {}
-            if not isinstance(arguments, dict):
-                arguments = {}
-
-            if tool_name and arguments:
-                arguments = _normalize_param_names(tool_name, arguments)
-                logger.info(f"[convert] enum=49 call_mcp_tool: {tool_name} args_keys={list(arguments.keys())}")
-                result.append({
-                    "id": tc.tool_call_id,
-                    "type": "function",
-                    "function": {
-                        "name": tool_name,
-                        "arguments": json.dumps(arguments),
-                    },
-                })
-                continue
-            elif tool_name and not arguments:
-                logger.info(f"[convert] enum=49 call_mcp_tool: {tool_name} with no arguments (parameterless tool)")
-                result.append({
-                    "id": tc.tool_call_id,
-                    "type": "function",
-                    "function": {
-                        "name": tool_name,
-                        "arguments": "{}",
-                    },
-                })
-                continue
-            else:
-                logger.warn(f"[convert] enum=49 but no toolName found in args: {tc.args}")
-
-        if tc.enum == 45:
-            uri = tc.args.get("uri") or tc.raw_args
-            if uri:
-                tool_name, tool_args = parse_resource_uri(uri)
-                logger.debug(f"[convert] parse_resource_uri({uri[:200]}) => name={tool_name} args_keys={list(tool_args.keys()) if tool_args else 'EMPTY'}")
-                if tool_name and tool_args:
-                    result.append({
-                        "id": tc.tool_call_id,
-                        "type": "function",
-                        "function": {
-                            "name": tool_name,
-                            "arguments": json.dumps(tool_args),
-                        },
-                    })
-                    continue
-                elif tool_name and not tool_args:
-                    logger.warn(f"[convert] enum=45 skipping {tool_name} with empty args")
-                    continue
-
-        if tc.name and tc.args:
-            logger.debug(f"[convert] Generic fallback: name={tc.name}")
-            result.append({
-                "id": tc.tool_call_id,
-                "type": "function",
-                "function": {
-                    "name": tc.name,
-                    "arguments": json.dumps(tc.args),
-                },
-            })
-    return result
-
 
 def _first_error_detail(errors: list) -> str:
     if not errors:
@@ -1059,17 +879,27 @@ def _first_error_detail(errors: list) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Streaming delta granularity — split large Cursor chunks into small SSE events
+# ---------------------------------------------------------------------------
+
+DELTA_TARGET_SIZE = 8  # chars per SSE event, simulates token-level streaming
+MIN_EVENT_DELAY = 0.003   # seconds — fast drain when queue is backlogged
+MAX_EVENT_DELAY = 0.015   # seconds — smooth pacing when stream is trickling in
+
+
+# ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
 
 
-async def run_claude_messages_pipeline(
-    payload: dict,
+async def run_pipeline(
+    req: UnifiedRequest,
     request_id: str,
     auth_token: str = "",
 ) -> dict:
-    """Main pipeline entry point.
+    """Format-agnostic pipeline entry point.
 
+    Accepts a UnifiedRequest (from normalize_anthropic or normalize_openai).
     Returns a dict with:
       - ok (bool)
       - stream (bool, if streaming)
@@ -1079,15 +909,28 @@ async def run_claude_messages_pipeline(
     """
     pipeline_start = time.monotonic()
 
-    normalized = normalize_anthropic_payload(payload)
-    messages = normalized["messages"]
-    tools = normalized["tools"]
-    stream = normalized["stream"]
-    resolved_model = normalized["resolved_model"]
-    controls = normalized["request_controls"]
+    messages = req.messages
+    tools = req.tools
+    stream = req.stream
+    resolved_model = req.model
+    max_tokens = req.max_tokens
+    original_format = req.original_format
     valid_tool_names = [(t.get("function") or t).get("name", "") for t in tools]
 
-    parsed_mt = _parse_max_tokens(controls.get("max_tokens"))
+    instruction_tool_prompt = build_tool_call_prompt(tools) if tools else ""
+    full_system = (req.system or "") + THALAMUS_INSTRUCTION_SUPPLEMENT
+    if instruction_tool_prompt:
+        full_system += "\n\n" + instruction_tool_prompt
+    messages = [{"role": "system", "content": full_system}] + messages
+
+    if req.metadata:
+        logger.info(f"[{request_id}] CC metadata: {json.dumps(req.metadata, ensure_ascii=False)[:200]}")
+    if req.thinking:
+        logger.info(f"[{request_id}] CC thinking config: {req.thinking}")
+    if req.context_management:
+        logger.debug(f"[{request_id}] CC context_management: {req.context_management}")
+
+    parsed_mt = _parse_max_tokens(max_tokens)
     if not parsed_mt["ok"]:
         return {
             "ok": False,
@@ -1104,60 +947,30 @@ async def run_claude_messages_pipeline(
         }
     max_tokens = parsed_mt["value"]
 
-    unsupported: list[str] = []
-    if controls.get("temperature") is not None:
-        unsupported.append("temperature")
-    if controls.get("top_p") is not None:
-        unsupported.append("top_p")
-    if controls.get("stop") is not None:
-        unsupported.append("stop")
-
     raw_req_token = _extract_raw_auth_token(auth_token)
-    # Only use request-supplied token if it looks like a real Cursor token
-    # (contains :: or starts with eyJ). Otherwise fall back to stored token.
     if raw_req_token and ("::" in raw_req_token or raw_req_token.startswith("eyJ")):
         token = raw_req_token
     else:
         token = get_cursor_access_token()
 
     logger.info(
-        f"[{request_id}] pipeline=claude_code model={resolved_model} stream={stream} tools={len(valid_tool_names)} msgs={len(messages)} max_tokens={max_tokens or '-'}"
+        f"[{request_id}] pipeline=claude_code format={original_format} model={resolved_model} "
+        f"stream={stream} tools={len(valid_tool_names)} msgs={len(messages)} max_tokens={max_tokens or '-'}"
     )
     if valid_tool_names and len(messages) <= 5:
-        logger.info(f"[{request_id}] CC tool names: {valid_tool_names}")
+        logger.info(f"[{request_id}] tool names: {valid_tool_names}")
         for t in tools[:5]:
             fn = t.get("function") or t
             tname = fn.get("name", "")
             tschema = fn.get("input_schema") or fn.get("parameters") or {}
             req_params = tschema.get("required", [])
             props = list((tschema.get("properties") or {}).keys())
-            logger.info(f"[{request_id}] CC tool schema: {tname} props={props} required={req_params}")
-
-    if unsupported:
-        logger.warn(
-            f"[{request_id}] Unsupported controls: {', '.join(unsupported)}"
-        )
-        return {
-            "ok": False,
-            "status": 400,
-            "body": _to_api_error_body(
-                f"Unsupported request controls: {', '.join(unsupported)}",
-                "invalid_request_error",
-            ),
-            "telemetry": {
-                "request_id": request_id,
-                "pipeline": "claude_code",
-                "model_requested": resolved_model,
-                "model_used": None,
-                "latency_ms": _elapsed_ms(pipeline_start),
-                "stream": stream,
-                "unsupported_controls": unsupported,
-            },
-        }
+            logger.info(f"[{request_id}] tool schema: {tname} props={props} required={req_params}")
 
     base_telemetry: dict[str, Any] = {
         "request_id": request_id,
         "pipeline": "claude_code",
+        "original_format": original_format,
         "model_requested": resolved_model,
         "max_tokens": max_tokens,
         "stream": stream,
@@ -1165,99 +978,302 @@ async def run_claude_messages_pipeline(
     }
 
     if stream:
-        message_id = f"msg_{uuid.uuid4().hex}"
-
-        async def stream_handler() -> AsyncIterator[str]:
-            """Async generator that yields SSE strings."""
-            session = StreamingAnthropicSession(message_id, resolved_model)
-            yield session.emit_message_start()
-
-            limiter = _OutputLimiter(max_tokens)
-            sse_queue: asyncio.Queue[str | None] = asyncio.Queue()
-
-            def on_text_delta(delta: str) -> None:
-                if not delta:
-                    return
-                limited = limiter.emit_within_limit(delta)
-                if limited:
-                    sse = session.emit_text_delta(limited)
-                    if sse:
-                        sse_queue.put_nowait(sse)
-
-            def on_thinking_delta(delta: str) -> None:
-                if not delta:
-                    return
-                limited = limiter.emit_within_limit(delta)
-                if limited:
-                    sse = session.emit_thinking_delta(limited)
-                    if sse:
-                        sse_queue.put_nowait(sse)
-
-            async def run_cursor_call() -> dict:
-                return await _call_cursor_direct(
-                    messages, resolved_model, tools, valid_tool_names, token,
-                    on_stream_delta=on_text_delta,
-                    on_thinking_delta=on_thinking_delta,
-                )
-
-            cursor_task = asyncio.create_task(run_cursor_call())
-
-            while not cursor_task.done() or not sse_queue.empty():
-                try:
-                    sse = await asyncio.wait_for(sse_queue.get(), timeout=0.05)
-                    if sse:
-                        yield sse
-                except asyncio.TimeoutError:
-                    continue
-
-            direct_result = cursor_task.result()
-
-            if direct_result.get("error"):
-                logger.error(
-                    f"[{request_id}] pipeline=claude_code stage=error(stream) error={direct_result['error']}"
-                )
-                yield session.finish(stop_reason="end_turn")
-                return
-
-            tool_calls = direct_result.get("tool_calls") or []
-
-            yield session.close_open_blocks()
-
-            if tool_calls:
-                yield session.emit_tool_use_blocks(tool_calls)
-
-            stop_reason: str
-            if tool_calls:
-                stop_reason = "tool_use"
-            elif limiter.is_exhausted:
-                stop_reason = "max_tokens"
-            else:
-                stop_reason = "end_turn"
-
-            yield session.finish(stop_reason=stop_reason)
-
-            used_model = direct_result.get("model") or resolved_model
-            latency = _elapsed_ms(pipeline_start)
-            logger.info(
-                f"[{request_id}] pipeline=claude_code stage=result(stream) model={used_model} "
-                f"tool_calls={len(tool_calls)} stop_reason={stop_reason} latency_ms={latency:.0f}"
-            )
-
-        return {
-            "ok": True,
-            "stream": True,
-            "stream_handler": stream_handler,
-            "telemetry": {**base_telemetry, "model_used": resolved_model},
-        }
+        return _build_streaming_result(
+            req, request_id, messages, tools, valid_tool_names,
+            resolved_model, max_tokens, token, original_format,
+            pipeline_start, base_telemetry,
+        )
 
     # --- Non-streaming (unary) path ---
+    return await _build_unary_result(
+        req, request_id, messages, tools, valid_tool_names,
+        resolved_model, max_tokens, token, original_format,
+        pipeline_start, base_telemetry,
+    )
+
+
+def _build_streaming_result(
+    req: UnifiedRequest,
+    request_id: str,
+    messages: list[dict],
+    tools: list[dict],
+    valid_tool_names: list[str],
+    resolved_model: str,
+    max_tokens: int | None,
+    token: str,
+    original_format: str,
+    pipeline_start: float,
+    base_telemetry: dict[str, Any],
+) -> dict:
+    """Build the streaming result dict with an async generator."""
+
+    if original_format == "openai":
+        return _build_streaming_result_openai(
+            request_id, messages, tools, valid_tool_names,
+            resolved_model, max_tokens, token,
+            pipeline_start, base_telemetry,
+        )
+    return _build_streaming_result_anthropic(
+        request_id, messages, tools, valid_tool_names,
+        resolved_model, max_tokens, token,
+        pipeline_start, base_telemetry,
+    )
+
+
+def _build_streaming_result_anthropic(
+    request_id: str,
+    messages: list[dict],
+    tools: list[dict],
+    valid_tool_names: list[str],
+    resolved_model: str,
+    max_tokens: int | None,
+    token: str,
+    pipeline_start: float,
+    base_telemetry: dict[str, Any],
+) -> dict:
+    message_id = f"msg_{uuid.uuid4().hex}"
+
+    async def stream_handler() -> AsyncIterator[str]:
+        session = StreamingAnthropicSession(message_id, resolved_model)
+        yield session.emit_message_start()
+
+        limiter = _OutputLimiter(max_tokens)
+        sse_queue: asyncio.Queue[str | None] = asyncio.Queue()
+
+        thinking_started = False
+        thinking_ended = False
+
+        def _enqueue_text_fragments(text: str) -> None:
+            """Split text into DELTA_TARGET_SIZE chunks and enqueue as text_delta SSE."""
+            for i in range(0, len(text), DELTA_TARGET_SIZE):
+                fragment = text[i:i + DELTA_TARGET_SIZE]
+                sse = session.emit_text_delta(fragment)
+                if sse:
+                    sse_queue.put_nowait(sse)
+
+        def on_thinking_as_text(delta: str) -> None:
+            nonlocal thinking_started
+            if not delta:
+                return
+            if not thinking_started:
+                thinking_started = True
+                _enqueue_text_fragments("thinking: ")
+            limited = limiter.emit_within_limit(delta)
+            if not limited:
+                return
+            _enqueue_text_fragments(limited)
+
+        def _emit_and_enqueue(text: str) -> str | None:
+            """Emit callback for ToolJsonAwareTextForwarder — splits into fragments."""
+            if text:
+                _enqueue_text_fragments(text)
+            return text
+
+        forwarder = ToolJsonAwareTextForwarder(
+            emit_text_delta=_emit_and_enqueue,
+            limiter=limiter,
+        )
+
+        def on_text_delta(delta: str) -> None:
+            nonlocal thinking_ended
+            if not delta:
+                return
+            if thinking_started and not thinking_ended:
+                thinking_ended = True
+                _enqueue_text_fragments("\n\n")
+            forwarder.on_delta(delta)
+
+        async def run_cursor_call() -> dict:
+            return await _call_cursor_direct(
+                messages, resolved_model, tools, valid_tool_names, token,
+                on_stream_delta=on_text_delta,
+                on_thinking_delta=on_thinking_as_text,
+            )
+
+        cursor_task = asyncio.create_task(run_cursor_call())
+
+        while not cursor_task.done() or not sse_queue.empty():
+            try:
+                sse = sse_queue.get_nowait()
+                if sse:
+                    yield sse
+                    depth = sse_queue.qsize()
+                    if depth > 5:
+                        await asyncio.sleep(MIN_EVENT_DELAY)
+                    elif depth <= 2:
+                        await asyncio.sleep(MAX_EVENT_DELAY)
+                    else:
+                        frac = (depth - 2) / 3.0
+                        await asyncio.sleep(MAX_EVENT_DELAY - frac * (MAX_EVENT_DELAY - MIN_EVENT_DELAY))
+            except asyncio.QueueEmpty:
+                await asyncio.sleep(0.005)
+
+        direct_result = cursor_task.result()
+
+        if direct_result.get("error"):
+            logger.error(
+                f"[{request_id}] pipeline=claude_code stage=error(stream) error={direct_result['error']}"
+            )
+            yield session.finish(stop_reason="end_turn")
+            return
+
+        tool_calls = direct_result.get("tool_calls") or []
+
+        full_text = direct_result.get("text", "")
+        final_safe = extract_text_before_json(full_text) if tool_calls else full_text
+        forwarder.flush_using_final_safe_text(final_safe)
+        while not sse_queue.empty():
+            sse = sse_queue.get_nowait()
+            if sse:
+                yield sse
+
+        yield session.close_open_blocks()
+
+        if tool_calls:
+            yield session.emit_tool_use_blocks(tool_calls)
+
+        stop_reason: str
+        if tool_calls:
+            stop_reason = "tool_use"
+        elif limiter.is_exhausted:
+            stop_reason = "max_tokens"
+        else:
+            stop_reason = "end_turn"
+
+        yield session.finish(stop_reason=stop_reason)
+
+        used_model = direct_result.get("model") or resolved_model
+        latency = _elapsed_ms(pipeline_start)
+        logger.info(
+            f"[{request_id}] pipeline=claude_code stage=result(stream/anthropic) model={used_model} "
+            f"tool_calls={len(tool_calls)} stop_reason={stop_reason} latency_ms={latency:.0f}"
+        )
+
+    return {
+        "ok": True,
+        "stream": True,
+        "stream_handler": stream_handler,
+        "telemetry": {**base_telemetry, "model_used": resolved_model},
+    }
+
+
+def _build_streaming_result_openai(
+    request_id: str,
+    messages: list[dict],
+    tools: list[dict],
+    valid_tool_names: list[str],
+    resolved_model: str,
+    max_tokens: int | None,
+    token: str,
+    pipeline_start: float,
+    base_telemetry: dict[str, Any],
+) -> dict:
+    completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+
+    async def stream_handler() -> AsyncIterator[str]:
+        session = StreamingOpenAISession(completion_id, resolved_model)
+        yield session.emit_role_chunk()
+
+        limiter = _OutputLimiter(max_tokens)
+        sse_queue: asyncio.Queue[str | None] = asyncio.Queue()
+
+        def on_text_delta(delta: str) -> None:
+            if not delta:
+                return
+            limited = limiter.emit_within_limit(delta)
+            if not limited:
+                return
+            for i in range(0, len(limited), DELTA_TARGET_SIZE):
+                fragment = limited[i:i + DELTA_TARGET_SIZE]
+                sse = session.emit_text_delta(fragment)
+                if sse:
+                    sse_queue.put_nowait(sse)
+
+        async def run_cursor_call() -> dict:
+            return await _call_cursor_direct(
+                messages, resolved_model, tools, valid_tool_names, token,
+                on_stream_delta=on_text_delta,
+            )
+
+        cursor_task = asyncio.create_task(run_cursor_call())
+
+        while not cursor_task.done() or not sse_queue.empty():
+            try:
+                sse = sse_queue.get_nowait()
+                if sse:
+                    yield sse
+                    depth = sse_queue.qsize()
+                    if depth > 5:
+                        await asyncio.sleep(MIN_EVENT_DELAY)
+                    elif depth <= 2:
+                        await asyncio.sleep(MAX_EVENT_DELAY)
+                    else:
+                        frac = (depth - 2) / 3.0
+                        await asyncio.sleep(MAX_EVENT_DELAY - frac * (MAX_EVENT_DELAY - MIN_EVENT_DELAY))
+            except asyncio.QueueEmpty:
+                await asyncio.sleep(0.005)
+
+        direct_result = cursor_task.result()
+
+        if direct_result.get("error"):
+            logger.error(
+                f"[{request_id}] pipeline=claude_code stage=error(stream) error={direct_result['error']}"
+            )
+            yield session.finish(stop_reason="stop")
+            return
+
+        tool_calls = direct_result.get("tool_calls") or []
+
+        if tool_calls:
+            yield session.emit_tool_use_blocks(tool_calls)
+
+        stop_reason: str
+        if tool_calls:
+            stop_reason = "tool_calls"
+        elif limiter.is_exhausted:
+            stop_reason = "length"
+        else:
+            stop_reason = "stop"
+
+        yield session.finish(stop_reason=stop_reason)
+
+        used_model = direct_result.get("model") or resolved_model
+        latency = _elapsed_ms(pipeline_start)
+        logger.info(
+            f"[{request_id}] pipeline=claude_code stage=result(stream/openai) model={used_model} "
+            f"tool_calls={len(tool_calls)} stop_reason={stop_reason} latency_ms={latency:.0f}"
+        )
+
+    return {
+        "ok": True,
+        "stream": True,
+        "stream_handler": stream_handler,
+        "telemetry": {**base_telemetry, "model_used": resolved_model},
+    }
+
+
+async def _build_unary_result(
+    req: UnifiedRequest,
+    request_id: str,
+    messages: list[dict],
+    tools: list[dict],
+    valid_tool_names: list[str],
+    resolved_model: str,
+    max_tokens: int | None,
+    token: str,
+    original_format: str,
+    pipeline_start: float,
+    base_telemetry: dict[str, Any],
+) -> dict:
+    """Build a non-streaming result."""
 
     direct_result = await _call_cursor_direct(
         messages, resolved_model, tools, valid_tool_names, token,
     )
 
     logger.info(
-        f"[{request_id}] DIRECT_RESULT(unary): text_len={len(direct_result.get('text', ''))} tool_calls={len(direct_result.get('tool_calls') or [])} error={direct_result.get('error')}"
+        f"[{request_id}] DIRECT_RESULT(unary): text_len={len(direct_result.get('text', ''))} "
+        f"tool_calls={len(direct_result.get('tool_calls') or [])} error={direct_result.get('error')}"
     )
 
     if direct_result.get("error"):
@@ -1276,7 +1292,6 @@ async def run_claude_messages_pipeline(
     tool_calls = direct_result.get("tool_calls") or []
     text = direct_result.get("text", "")
     thinking = direct_result.get("thinking", "")
-    message_id = f"msg_{uuid.uuid4().hex}"
 
     truncated = False
     if max_tokens and max_tokens > 0:
@@ -1299,21 +1314,34 @@ async def run_claude_messages_pipeline(
     }
 
     logger.info(
-        f"[{request_id}] pipeline=claude_code stage=result model={used_model} tool_calls={len(tool_calls)} "
-        f"text_len={len(text)} latency_ms={telemetry['latency_ms']:.0f}"
+        f"[{request_id}] pipeline=claude_code stage=result model={used_model} "
+        f"tool_calls={len(tool_calls)} text_len={len(text)} latency_ms={telemetry['latency_ms']:.0f}"
     )
 
-    return {
-        "ok": True,
-        "stream": False,
-        "body": build_unary_anthropic_response(
+    if original_format == "openai":
+        completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+        body = build_unary_openai_response(
+            completion_id=completion_id,
+            model=used_model,
+            text=text,
+            tool_calls=tool_calls,
+            stop_reason_override=stop_reason_override,
+        )
+    else:
+        message_id = f"msg_{uuid.uuid4().hex}"
+        body = build_unary_anthropic_response(
             message_id=message_id,
             model=used_model,
             text=text,
             thinking="",
             tool_calls=tool_calls,
             stop_reason_override=stop_reason_override,
-        ),
+        )
+
+    return {
+        "ok": True,
+        "stream": False,
+        "body": body,
         "telemetry": telemetry,
     }
 

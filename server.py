@@ -20,6 +20,8 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from routes.anthropic_messages import router as anthropic_router
+from routes.openai_chat import router as openai_router
+from routes.model_routes import router as model_router
 from routes.token_routes import router as token_router
 from routes.login_routes import router as login_router
 
@@ -34,6 +36,8 @@ app.add_middleware(
 )
 
 app.include_router(anthropic_router)
+app.include_router(openai_router)
+app.include_router(model_router)
 app.include_router(token_router)
 app.include_router(login_router)
 
@@ -48,6 +52,21 @@ async def health():
         "status": "ok",
         "has_token": has_cursor_access_token(),
     }
+
+@app.get("/api/hello")
+async def api_hello():
+    """CC SDK calls BASE_API_URL/api/hello as a connectivity check during startup."""
+    return {"status": "ok"}
+
+@app.get("/v1/oauth/hello")
+async def oauth_hello():
+    """CC SDK calls TOKEN_URL/v1/oauth/hello during auth health check."""
+    return {"status": "ok"}
+
+@app.post("/v1/messages/count_tokens")
+async def count_tokens():
+    """CC SDK may call this for token counting; return a dummy response."""
+    return {"input_tokens": 0}
 
 if __name__ == "__main__":
     import uvicorn

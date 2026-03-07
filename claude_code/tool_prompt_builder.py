@@ -1,21 +1,21 @@
 from __future__ import annotations
 
-"""Tool call prompt builder — injects MCP resource descriptions into messages."""
+"""Tool call prompt builder — injects tool descriptions into messages.
 
+Tool calling is handled entirely via prompt injection: tool descriptions
+are serialized into the system/user prompt as text, and the model outputs
+tool calls as JSON in its text response. No MCP/URI/protobuf tool call
+mechanism is used.
+"""
+
+import json
 import re
 
-from config.mcp_resource_registry import build_tool_prompt, MCP_SERVER_NAME
 from config.system_prompt import (
     DECONTAMINATION_REMINDER,
     EXECUTION_NUDGE,
     TURN1_USER,
     TURN2_ASSISTANT,
-    TURN3_USER,
-    TURN4_ASSISTANT,
-    TURN5_EXECUTION_RULES,
-    TURN6_ASSISTANT_ACK,
-    TURN7_BEHAVIORAL_STANDARDS,
-    TURN8_ASSISTANT_ACK,
 )
 
 ASK_MODE_CONTAMINATION_PATTERNS: list[re.Pattern] = [
@@ -54,8 +54,58 @@ ASK_MODE_CONTAMINATION_PATTERNS: list[re.Pattern] = [
 
 
 def build_tool_call_prompt(tools: list[dict]) -> str:
-    """Build prompt describing tools as MCP tools for call_mcp_tool invocation."""
-    return build_tool_prompt(tools)
+    """Build a text prompt describing available tools.
+
+    The model should output tool calls as JSON:
+      {"tool_calls": [{"function": {"name": "ToolName", "arguments": {...}}}]}
+    """
+    lines = [
+        "You have access to the following tools.\n"
+        "When you need to perform an action, output a JSON object:\n"
+        '  {"tool_calls": [{"function": {"name": "<ToolName>", "arguments": {<params>}}}]}\n\n'
+        "Examples:\n"
+        '  {"tool_calls": [{"function": {"name": "Bash", "arguments": {"command": "ls -la"}}}]}\n'
+        '  {"tool_calls": [{"function": {"name": "Read", "arguments": {"file_path": "/tmp/app.go"}}}]}\n'
+        '  {"tool_calls": [{"function": {"name": "Write", "arguments": {"file_path": "/tmp/app.go", "content": "package main\\n"}}}]}\n'
+        '  {"tool_calls": [{"function": {"name": "Edit", "arguments": {"file_path": "/tmp/app.go", "old_string": "old", "new_string": "new"}}}]}\n'
+    ]
+
+    count = 0
+    for tool_def in tools:
+        fn = tool_def.get("function") or tool_def
+        name = fn.get("name", "")
+        if not name:
+            continue
+
+        desc = fn.get("description", "")
+
+        input_schema = fn.get("input_schema") or fn.get("parameters") or {}
+        properties = input_schema.get("properties") or {}
+        required = set(input_schema.get("required") or [])
+
+        param_parts = []
+        for pname, pdef in properties.items():
+            ptype = pdef.get("type", "string")
+            pdesc = pdef.get("description", "")
+            req_marker = " [required]" if pname in required else ""
+            line = f"    {pname}: {ptype}{req_marker}"
+            if pdesc:
+                line += f" — {pdesc}"
+            param_parts.append(line)
+        params_block = "\n".join(param_parts) if param_parts else "    (no parameters)"
+
+        count += 1
+        lines.append(
+            f"{count}. Tool: {name}\n"
+            f"  Description: {desc}\n"
+            f"  Parameters:\n{params_block}"
+        )
+
+    lines.append(
+        f"\nTotal: {count} tool(s). Use tool_calls JSON for ALL actions — never narrate."
+    )
+
+    return "\n\n".join(lines)
 
 
 def _extract_message_content(msg: dict) -> str:
@@ -132,15 +182,6 @@ def inject_tool_prompt_into_messages(
     result.append({"role": "user", "content": TURN1_USER})
     result.append({"role": "assistant", "content": TURN2_ASSISTANT})
 
-    result.append({"role": "user", "content": TURN3_USER})
-    result.append({"role": "assistant", "content": TURN4_ASSISTANT})
-
-    result.append({"role": "user", "content": TURN5_EXECUTION_RULES})
-    result.append({"role": "assistant", "content": TURN6_ASSISTANT_ACK})
-
-    result.append({"role": "user", "content": TURN7_BEHAVIORAL_STANDARDS})
-    result.append({"role": "assistant", "content": TURN8_ASSISTANT_ACK})
-
     if tools:
         tool_names = []
         for td in tools:
@@ -149,7 +190,7 @@ def inject_tool_prompt_into_messages(
             if n:
                 tool_names.append(n)
         discovery_msg = (
-            f"[MCP Discovery Complete] Connected to MCP server '{MCP_SERVER_NAME}'. "
+            f"[Tool Discovery Complete] "
             f"Available tools ({len(tool_names)}): {', '.join(tool_names[:20])}{'...' if len(tool_names) > 20 else ''}.\n\n"
         )
         discovery_msg += build_tool_call_prompt(tools)
@@ -157,10 +198,7 @@ def inject_tool_prompt_into_messages(
         result.append({
             "role": "assistant",
             "content": (
-                f"Acknowledged. MCP server '{MCP_SERVER_NAME}' connected with {len(tool_names)} tools. "
-                "I will use fetch_mcp_resource with JSON fragment URIs for tool invocations. "
-                "Format: scheme://authority#{JSON}. JSON handles all escaping natively — "
-                "no URL-encoding needed. Ready."
+                f"收到。{len(tool_names)} 个工具已就绪，通过 tool_calls JSON 调用。有什么需要执行的？"
             ),
         })
 
@@ -244,11 +282,11 @@ def inject_tool_prompt_into_messages(
                 content_text = _extract_message_content(m)
                 if content_text.strip():
                     parts.append(content_text)
+                tc_json_list = []
                 for tc in tool_calls_list:
                     fn = tc.get("function") or tc
-                    tc_name = fn.get("name", "unknown")
-                    tc_args = fn.get("arguments", "{}")
-                    parts.append(f"<tool_executed name=\"{tc_name}\" input={tc_args} />")
+                    tc_json_list.append({"function": {"name": fn.get("name", "unknown"), "arguments": _json.loads(fn.get("arguments", "{}")) if isinstance(fn.get("arguments"), str) else fn.get("arguments", {})}})
+                parts.append(_json.dumps({"tool_calls": tc_json_list}, ensure_ascii=False))
                 result.append({
                     "role": "assistant",
                     "content": "\n".join(parts),
@@ -262,6 +300,7 @@ def inject_tool_prompt_into_messages(
                 )
                 if has_tool_use:
                     parts = []
+                    tc_json_list = []
                     for block in raw_content:
                         if isinstance(block, dict):
                             if block.get("type") == "text":
@@ -269,11 +308,9 @@ def inject_tool_prompt_into_messages(
                                 if t.strip():
                                     parts.append(t)
                             elif block.get("type") == "tool_use":
-                                tool_name = block.get("name", "unknown")
-                                tool_input = block.get("input", {})
-                                parts.append(
-                                    f"<tool_executed name=\"{tool_name}\" input={_json.dumps(tool_input, ensure_ascii=False)} />"
-                                )
+                                tc_json_list.append({"function": {"name": block.get("name", "unknown"), "arguments": block.get("input", {})}})
+                    if tc_json_list:
+                        parts.append(_json.dumps({"tool_calls": tc_json_list}, ensure_ascii=False))
                     result.append({
                         "role": "assistant",
                         "content": "\n".join(parts) if parts else "(ok)",

@@ -513,7 +513,6 @@ def _legacy_parse_natural_language(text: str) -> list[dict] | None:
 KNOWN_TOOL_NAMES = {
     "Read", "Write", "Edit", "MultiEdit", "Bash", "Glob", "Grep",
     "WebFetch", "WebSearch", "TodoRead", "TodoWrite", "Task",
-    "fetch_mcp_resource", "mcp__pencil",
 }
 
 

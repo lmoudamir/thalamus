@@ -15,3 +15,4 @@ vendor/
 logs/
 .DS_Store
 _raw_cc_request.json
+reference/anthropic-adapters/

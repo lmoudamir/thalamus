@@ -91,6 +91,15 @@ def build_gzip_framed_protobuf_chat_request_body(
     )
 
     formatted: list[dict] = []
+
+    if instruction_text:
+        formatted.append({
+            "content": f"[system]\n{instruction_text}\n[/system]",
+            "role": 1,
+            "messageId": str(uuid4()),
+            "chatModeEnum": mode_enum,
+        })
+
     for m in parsed:
         if m.get("role") == "system":
             continue
@@ -158,9 +167,9 @@ def build_gzip_framed_protobuf_chat_request_body(
 
     r.unknown27 = 1 if agent_mode else 0
 
-    if agent_mode:
-        for tid in (19, 44, 45, 49):
-            r.supportedTools.append(tid)
+    # supportedTools left empty — tool calling is handled entirely via
+    # prompt injection + text-based JSON parsing, not Cursor's native
+    # protobuf tool call mechanism.
 
     for mid in message_ids:
         proto_mid = r.messageIds.add()

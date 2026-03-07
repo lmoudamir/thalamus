@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>CalorieCam - 拍照算卡路里</title>
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{--bg:#0f0f13;--card:#1a1a24;--border:#2a2a3a;--accent:#6c5ce7;--accent2:#a29bfe;--text:#e0e0e8;--text2:#8888a0;--success:#00b894;--danger:#ff6b6b}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:var(--bg);color:var(--text);min-height:100dvh;display:flex;flex-direction:column;align-items:center}
+.container{width:100%;max-width:480px;padding:16px}
+header{text-align:center;padding:24px 0 16px}
+header h1{font-size:28px;background:linear-gradient(135deg,var(--accent),var(--accent2));-webkit-background-clip:text;-webkit-text-fill-color:transparent;font-weight:800}
+header p{color:var(--text2);font-size:13px;margin-top:4px}
+.upload-zone{border:2px dashed var(--border);border-radius:20px;padding:40px 20px;text-align:center;cursor:pointer;transition:all .3s;background:var(--card);position:relative;overflow:hidden}
+.upload-zone:hover,.upload-zone.dragover{border-color:var(--accent);background:#1e1e30}
+.upload-zone .icon{font-size:48px;margin-bottom:12px}
+.upload-zone .label{color:var(--text2);font-size:14px}
+.upload-zone .sublabel{color:var(--text2);font-size:12px;margin-top:6px;opacity:.6}
+input[type=file]{display:none}
+.preview-section{margin-top:16px;display:none}
+.preview-section.active{display:block}
+.preview-img{width:100%;border-radius:16px;object-fit:cover;max-height:320px;border:1px solid var(--border)}
+.btn-row{display:flex;gap:10px;margin-top:12px}
+.btn{flex:1;padding:14px;border:none;border-radius:12px;font-size:15px;font-weight:600;cursor:pointer;transition:all .2s}
+.btn-primary{background:var(--accent);color:#fff}
+.btn-primary:hover{background:var(--accent2)}
+.btn-primary:disabled{opacity:.5;cursor:not-allowed}
+.btn-secondary{background:var(--card);color:var(--text2);border:1px solid var(--border)}
+.loading-overlay{display:none;margin-top:20px;text-align:center;padding:40px}
+.loading-overlay.active{display:block}
+.spinner{width:48px;height:48px;border:4px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin 1s linear infinite;margin:0 auto 16px}
+@keyframes spin{to{transform:rotate(360deg)}}
+.loading-text{color:var(--text2);font-size:14px}
+.loading-dots::after{content:'';animation:dots 1.5s steps(4,end) infinite}
+@keyframes dots{0%{content:''}25%{content:'.'}50%{content:'..'}75%{content:'...'}}
+.result-card{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:20px;margin-top:20px;display:none;animation:fadeIn .4s}
+.result-card.active{display:block}
+.result-card h3{color:var(--accent2);margin-bottom:12px;font-size:16px}
+.result-content{line-height:1.8;font-size:14px;color:var(--text)}
+.result-content table{width:100%;border-collapse:collapse;margin:12px 0}
+.result-content th,.result-content td{padding:8px 10px;border:1px solid var(--border);text-align:left;font-size:13px}
+.result-content th{background:rgba(108,92,231,.15);color:var(--accent2)}
+.result-content strong{color:var(--success)}
+.result-content ul,.result-content ol{padding-left:20px}
+.error-msg{background:rgba(255,107,107,.1);border:1px solid var(--danger);border-radius:12px;padding:16px;margin-top:16px;color:var(--danger);font-size:13px;display:none}
+.error-msg.active{display:block}
+.stats{margin-top:12px;padding:12px;background:rgba(108,92,231,.06);border-radius:10px;font-size:12px;color:var(--text2);display:none}
+.stats.active{display:flex;justify-content:space-between}
+footer{text-align:center;padding:24px;color:var(--text2);font-size:11px;opacity:.5;margin-top:auto}
+@keyframes fadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+</style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <h1>CalorieCam</h1>
+    <p>拍照或上传食物图片，AI 帮你估算卡路里</p>
+  </header>
+
+  <div class="upload-zone" id="dropZone">
+    <div class="icon">📸</div>
+    <div class="label">点击拍照 / 选择图片</div>
+    <div class="sublabel">支持 JPG、PNG，建议 &lt; 4MB</div>
+  </div>
+  <input type="file" id="fileInput" accept="image/*" capture="environment">
+
+  <div class="preview-section" id="previewSection">
+    <img id="previewImg" class="preview-img">
+    <div class="btn-row">
+      <button class="btn btn-secondary" id="btnReset">重新选择</button>
+      <button class="btn btn-primary" id="btnAnalyze">🔍 开始分析</button>
+    </div>
+  </div>
+
+  <div class="loading-overlay" id="loadingOverlay">
+    <div class="spinner"></div>
+    <div class="loading-text">AI 正在分析食物<span class="loading-dots"></span></div>
+  </div>
+
+  <div class="error-msg" id="errorMsg"></div>
+
+  <div class="result-card" id="resultCard">
+    <h3>📊 分析结果</h3>
+    <div class="result-content" id="resultContent"></div>
+  </div>
+
+  <div class="stats" id="statsBar">
+    <span id="statModel"></span>
+    <span id="statLatency"></span>
+  </div>
+</div>
+<footer>Powered by Thalamus Proxy · CalorieCam v1.0</footer>
+
+<script>
+const API_URL = 'http://localhost:3013/v1/messages';
+const API_KEY = 'thalamus-proxy';
+const MODEL = 'gpt-5.3-codex-spark-preview-xhigh';
+const PROMPT = '请仔细分析这张食物图片。按以下格式回答：\n\n' +
+  '| 食物名称 | 估算重量(g) | 卡路里(kcal) |\n' +
+  '|----------|------------|-------------|\n' +
+  '| ... | ... | ... |\n\n' +
+  '**总卡路里：XXX kcal**\n\n' +
+  '如果图片不是食物，请说明。用中文回答。';
+
+const $ = id => document.getElementById(id);
+const dropZone = $('dropZone');
+const fileInput = $('fileInput');
+const previewSection = $('previewSection');
+const previewImg = $('previewImg');
+const btnReset = $('btnReset');
+const btnAnalyze = $('btnAnalyze');
+const loadingOverlay = $('loadingOverlay');
+const errorMsg = $('errorMsg');
+const resultCard = $('resultCard');
+const resultContent = $('resultContent');
+const statsBar = $('statsBar');
+
+let currentBase64 = null;
+let currentMediaType = 'image/jpeg';
+
+dropZone.addEventListener('click', () => fileInput.click());
+dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('dragover'); });
+dropZone.addEventListener('dragleave', () => dropZone.classList.remove('dragover'));
+dropZone.addEventListener('drop', e => {
+  e.preventDefault();
+  dropZone.classList.remove('dragover');
+  if (e.dataTransfer.files.length) handleFile(e.dataTransfer.files[0]);
+});
+fileInput.addEventListener('change', e => { if (e.target.files.length) handleFile(e.target.files[0]); });
+
+function handleFile(file) {
+  if (!file.type.startsWith('image/')) {
+    showError('请选择图片文件');
+    return;
+  }
+  currentMediaType = file.type || 'image/jpeg';
+  const reader = new FileReader();
+  reader.onload = e => {
+    const dataUrl = e.target.result;
+    currentBase64 = dataUrl.split(',')[1];
+    previewImg.src = dataUrl;
+    previewSection.classList.add('active');
+    dropZone.style.display = 'none';
+    hideError();
+    resultCard.classList.remove('active');
+    statsBar.classList.remove('active');
+  };
+  reader.readAsDataURL(file);
+}
+
+btnReset.addEventListener('click', () => {
+  currentBase64 = null;
+  fileInput.value = '';
+  previewSection.classList.remove('active');
+  dropZone.style.display = '';
+  resultCard.classList.remove('active');
+  statsBar.classList.remove('active');
+  hideError();
+});
+
+btnAnalyze.addEventListener('click', analyze);
+
+async function analyze() {
+  if (!currentBase64) return;
+  btnAnalyze.disabled = true;
+  loadingOverlay.classList.add('active');
+  resultCard.classList.remove('active');
+  statsBar.classList.remove('active');
+  hideError();
+
+  const t0 = Date.now();
+  try {
+    const resp = await fetch(API_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': API_KEY },
+      body: JSON.stringify({
+        model: MODEL,
+        max_tokens: 2048,
+        messages: [{
+          role: 'user',
+          content: [
+            { type: 'image', source: { type: 'base64', media_type: currentMediaType, data: currentBase64 } },
+            { type: 'text', text: PROMPT }
+          ]
+        }]
+      })
+    });
+    const data = await resp.json();
+    const latency = Date.now() - t0;
+
+    if (data.error) throw new Error(data.error.message || JSON.stringify(data.error));
+
+    let text = '';
+    if (data.content) {
+      text = data.content.map(b => b.text || '').join('\n');
+    } else if (data.text) {
+      text = data.text;
+    }
+
+    if (!text) throw new Error('API 返回为空');
+
+    try {
+      resultContent.innerHTML = marked.parse(text);
+    } catch {
+      resultContent.innerHTML = text.replace(/\n/g, '<br>');
+    }
+    resultCard.classList.add('active');
+
+    $('statModel').textContent = `模型: ${data.model || MODEL}`;
+    $('statLatency').textContent = `耗时: ${(latency / 1000).toFixed(1)}s`;
+    statsBar.classList.add('active');
+  } catch (err) {
+    showError(`分析失败: ${err.message}`);
+  } finally {
+    loadingOverlay.classList.remove('active');
+    btnAnalyze.disabled = false;
+  }
+}
+
+function showError(msg) { errorMsg.textContent = msg; errorMsg.classList.add('active'); }
+function hideError() { errorMsg.classList.remove('active'); }
+</script>
+</body>
+</html>
