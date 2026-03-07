@@ -313,6 +313,12 @@ A native macOS desktop launcher — no terminal needed, just double-click and go
 | **API test panel** | Fetch model list, send test messages, switch models — all in the UI |
 | **Lightweight** | Swift + WKWebView, ~270KB, no Electron |
 
+<p align="center">
+  <img src="assets/desktop-app-main.png" width="320" alt="Thalamus Desktop App — Main" />
+  &nbsp;&nbsp;
+  <img src="assets/desktop-app-test.png" width="320" alt="Thalamus Desktop App — API Test" />
+</p>
+
 ### Prerequisites
 
 - **macOS 10.15+** (Catalina or later)
@@ -643,6 +649,12 @@ export OPENAI_API_KEY=thalamus-proxy
 > **[⬇ 下载 Thalamus.app (macOS)](https://github.com/guojun21/thalamus/releases/latest/download/Thalamus-macOS.zip)**
 
 原生 macOS 桌面启动器，不用终端，双击即用。
+
+<p align="center">
+  <img src="assets/desktop-app-main.png" width="320" alt="Thalamus 桌面应用 — 主界面" />
+  &nbsp;&nbsp;
+  <img src="assets/desktop-app-test.png" width="320" alt="Thalamus 桌面应用 — API 测试" />
+</p>
 
 **前置条件：** macOS 10.15+、Python 3.10+、Cursor Pro/Business 订阅
 
