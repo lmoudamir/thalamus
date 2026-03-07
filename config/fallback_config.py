@@ -173,22 +173,23 @@ _DEFAULT_FALLBACK_CHAINS = {
     'composer-1.5': ['default'],
     'default': [],
 
-    # --- fast virtual model: speed-optimized chain (benchmarked 4 rounds) ---
-    # Priority: fastest first, then stable fallbacks, then last-resort
-    # S-tier (avg <2s): spark-preview, spark-preview-low
-    # A-tier (avg 3-4s, 100% stable): spark-preview-xhigh, 5.4-medium-fast, 5.2-fast
-    # B-tier (avg 3s, 75% stable): 5.2-low-fast
-    # C-tier (avg 7s, 100% stable): 5-mini
+    # --- fast virtual model: speed-optimized chain ---
+    # Direct Cursor API benchmark (bypassing Thalamus fallback):
+    #   1.03s cursor-small       | 1.06s spark-preview-low  | 1.14s composer-1.5
+    #   1.15s spark-preview-xhigh| 1.61s gpt-4o-mini        | 1.64s gemini-2.5-flash
+    #   1.71s spark-preview      | 1.81s grok-code-fast-1   | 4.25s grok-3-mini
+    # Excluded: gpt-5.2-fast/5.4-medium-fast (usage cap), claude/deepseek (invalid),
+    #           o3-mini/o4-mini/gpt-4o (20s+), grok-3/gemini-3-flash/claude-4.x (90s+)
     'fast': [
-        'gpt-5.3-codex-spark-preview',
         'gpt-5.3-codex-spark-preview-low',
-        'gpt-5.3-codex-spark-preview-xhigh',
-        'gpt-5.4-medium-fast',
-        'gpt-5.2-fast',
-        'gpt-5.2-low-fast',
-        'gpt-5-mini',
         'composer-1.5',
-        'default',
+        'gpt-5.3-codex-spark-preview-xhigh',
+        'gpt-4o-mini',
+        'gemini-2.5-flash',
+        'gpt-5.3-codex-spark-preview',
+        'grok-code-fast-1',
+        'grok-3-mini',
+        'gpt-5-mini',
     ],
 
     # --- thalamus virtual model: full 22-stop chain ---
