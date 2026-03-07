@@ -302,31 +302,75 @@ All settings go in `.env` (copy from `.env.example`). Most users only need `CURS
 
 ## Desktop App
 
-> **[Download Thalamus.app (macOS)](https://github.com/guojun21/thalamus/releases/latest/download/Thalamus-macOS.zip)**
+> **[⬇ Download Thalamus.app for macOS](https://github.com/guojun21/thalamus/releases/latest/download/Thalamus-macOS.zip)** &nbsp; *(currently macOS only, Windows/Linux coming soon)*
 
-A native macOS desktop launcher that wraps Thalamus into a one-click experience:
+A native macOS desktop launcher — no terminal needed, just double-click and go.
 
-- **One-click start** — double-click the app icon, backend starts automatically
-- **Built-in login** — Cursor PKCE login with automatic token save
-- **API test panel** — test model list and send messages with model selection
-- **Lightweight** — Swift + WKWebView, ~270KB, no Electron
+| Feature | Description |
+|---------|-------------|
+| **One-click start** | Double-click the app, thalamus-py backend starts automatically |
+| **Built-in login** | Cursor PKCE login right in the app, token saved automatically |
+| **API test panel** | Fetch model list, send test messages, switch models — all in the UI |
+| **Lightweight** | Swift + WKWebView, ~270KB, no Electron |
 
-### Install from Release
+### Prerequisites
 
-1. Download [`Thalamus-macOS.zip`](https://github.com/guojun21/thalamus/releases/latest/download/Thalamus-macOS.zip)
-2. Unzip and drag `Thalamus.app` to `/Applications`
-3. Double-click to launch
+- **macOS 10.15+** (Catalina or later)
+- **Python 3.10+** installed on your system (`python3 --version` to check)
+- **Cursor Pro/Business** subscription
 
-### Build from Source
+### Install (3 steps)
+
+**Step 1: Set up Python environment**
+
+You need to clone the repo and install dependencies first — the app uses this as its backend:
 
 ```bash
+git clone https://github.com/guojun21/thalamus.git
 cd thalamus
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-cd desktop-app && bash build.sh
 ```
 
-> **Note:** The app requires Python 3.10+ and thalamus-py dependencies to be installed on your system.
+**Step 2: Download and install the app**
+
+1. Download [`Thalamus-macOS.zip`](https://github.com/guojun21/thalamus/releases/latest/download/Thalamus-macOS.zip)
+2. Unzip it
+3. Drag `Thalamus.app` to your `/Applications` folder (or anywhere you like)
+
+> If macOS says "Thalamus can't be opened because it is from an unidentified developer", go to **System Settings → Privacy & Security** and click **Open Anyway**.
+
+**Step 3: Launch**
+
+Double-click `Thalamus.app`. You'll see:
+
+1. The app window opens with service status
+2. Backend starts automatically (status turns green when ready)
+3. If you haven't logged in before, click **🔑 登录 Cursor 账号** — your browser opens the Cursor login page
+4. Complete login in the browser — the app detects it and saves your token
+5. Done! Token persists across restarts (~60 days validity)
+
+### Build from Source
+
+If you prefer to build the `.app` yourself instead of downloading:
+
+```bash
+cd thalamus/desktop-app
+bash build.sh
+# Output: dist/Thalamus.app
+```
+
+Requires Xcode Command Line Tools (`xcode-select --install`) for the Swift compiler.
+
+### Platform Support
+
+| Platform | Status |
+|----------|--------|
+| **macOS** (Apple Silicon & Intel) | ✅ Available now |
+| **Windows** | 🚧 Planned |
+| **Linux** | 🚧 Planned |
+
+> Windows and Linux users: use the [command-line setup](#quick-start-5-minutes) for now.
 
 ## Architecture
 
@@ -594,25 +638,52 @@ export OPENAI_BASE_URL=http://localhost:3013/v1
 export OPENAI_API_KEY=thalamus-proxy
 ```
 
-### 桌面应用
+### 桌面应用（目前仅 macOS）
 
-> **[下载 Thalamus.app (macOS)](https://github.com/guojun21/thalamus/releases/latest/download/Thalamus-macOS.zip)**
+> **[⬇ 下载 Thalamus.app (macOS)](https://github.com/guojun21/thalamus/releases/latest/download/Thalamus-macOS.zip)**
 
-原生 macOS 桌面启动器，双击即用：
+原生 macOS 桌面启动器，不用终端，双击即用。
 
-- 自动启动 thalamus-py 后端
-- 内置 Cursor 登录（PKCE 认证，Token 自动保存）
-- API 测试面板（模型列表 + 消息测试，可切换模型）
-- 轻量级：Swift + WKWebView，~270KB，无需 Electron
+**前置条件：** macOS 10.15+、Python 3.10+、Cursor Pro/Business 订阅
+
+**安装步骤：**
+
+1. 先克隆仓库并安装 Python 依赖（app 需要这些作为后端）：
+
+```bash
+git clone https://github.com/guojun21/thalamus.git
+cd thalamus
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+2. 下载 [`Thalamus-macOS.zip`](https://github.com/guojun21/thalamus/releases/latest/download/Thalamus-macOS.zip)，解压后拖到 `/Applications`
+3. 双击打开 Thalamus.app
+
+> 如果 macOS 提示"无法打开"，去 **系统设置 → 隐私与安全性**，点击 **仍要打开**。
+
+**首次使用：**
+
+1. 打开 app → 等待服务状态变绿（运行中）
+2. 点击「🔑 登录 Cursor 账号」→ 浏览器自动打开登录页
+3. 在浏览器完成登录 → app 自动检测并保存 Token
+4. 搞定！Token 会一直保存（约 60 天有效），下次打开不用重新登录
 
 **从源码构建：**
 
 ```bash
-cd thalamus
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-cd desktop-app && bash build.sh
+cd thalamus/desktop-app && bash build.sh
 ```
+
+需要 Xcode 命令行工具（`xcode-select --install`）。
+
+| 平台 | 状态 |
+|------|------|
+| **macOS**（Apple Silicon & Intel） | ✅ 已支持 |
+| **Windows** | 🚧 计划中 |
+| **Linux** | 🚧 计划中 |
+
+> Windows / Linux 用户请用[命令行方式](#第一步安装-thalamus)。
 
 ### 常见问题
 
