@@ -9,11 +9,11 @@ mechanism is used.
 """
 
 import json
+import logging
 import re
 
 from config.system_prompt import (
     DECONTAMINATION_REMINDER,
-    EXECUTION_NUDGE,
     TURN1_USER,
     TURN2_ASSISTANT,
 )
@@ -174,33 +174,19 @@ def _is_text_only_assistant_needing_nudge(content: str) -> bool:
 
 
 def inject_tool_prompt_into_messages(
-    messages: list[dict], tools: list[dict]
+    messages: list[dict], tools: list[dict],
+    stub_reminder: str = "",
+    reminder_interval: int = 15,
 ) -> list[dict]:
-    """Inject tool-call prompt and system turns into OpenAI-format messages."""
+    """Inject tool-call prompt and system turns into OpenAI-format messages.
+
+    If stub_reminder is provided, it's injected every reminder_interval
+    user-turns to keep tool protocol fresh in the LLM's attention window.
+    """
     result: list[dict] = []
 
     result.append({"role": "user", "content": TURN1_USER})
     result.append({"role": "assistant", "content": TURN2_ASSISTANT})
-
-    if tools:
-        tool_names = []
-        for td in tools:
-            fn = td.get("function") or td
-            n = fn.get("name", "")
-            if n:
-                tool_names.append(n)
-        discovery_msg = (
-            f"[Tool Discovery Complete] "
-            f"Available tools ({len(tool_names)}): {', '.join(tool_names[:20])}{'...' if len(tool_names) > 20 else ''}.\n\n"
-        )
-        discovery_msg += build_tool_call_prompt(tools)
-        result.append({"role": "user", "content": discovery_msg})
-        result.append({
-            "role": "assistant",
-            "content": (
-                f"收到。{len(tool_names)} 个工具已就绪，通过 tool_calls JSON 调用。有什么需要执行的？"
-            ),
-        })
 
     # Build tool_use_id → tool_name map for rich few-shot context
     _tool_id_to_name: dict[str, str] = {}
@@ -325,20 +311,54 @@ def inject_tool_prompt_into_messages(
 
         result.append(m)
 
-    recent_assistant = None
-    for i in range(len(result) - 1, -1, -1):
-        if result[i].get("role") == "assistant":
-            recent_assistant = result[i]
-            break
-        if result[i].get("role") == "user":
-            break
-    if recent_assistant and _is_text_only_assistant_needing_nudge(
-        _extract_message_content(recent_assistant)
-    ):
-        result.append({"role": "user", "content": EXECUTION_NUDGE})
+    if stub_reminder and reminder_interval > 0:
+        result = _inject_periodic_reminders(result, stub_reminder, reminder_interval)
 
     result = _merge_consecutive_same_role(result)
     return result
+
+
+def _inject_periodic_reminders(
+    messages: list[dict], reminder: str, interval: int
+) -> list[dict]:
+    """Insert a tool-protocol reminder every `interval` user turns.
+
+    Walks the converted message list and counts user messages (skipping
+    the initial TURN1 priming message at index 0).  After every `interval`th
+    user message, a synthetic assistant ack + user reminder pair is inserted
+    so the LLM re-attends to the tool-calling protocol.
+
+    The injection only happens between user→assistant boundaries — never
+    inside a tool_result flow — to avoid breaking the conversation structure.
+    """
+    if interval <= 0 or not reminder:
+        return messages
+
+    out: list[dict] = []
+    user_count = 0
+    skip_first_user = True
+
+    for i, m in enumerate(messages):
+        if m.get("role") == "user":
+            if skip_first_user:
+                skip_first_user = False
+                out.append(m)
+                continue
+            user_count += 1
+            if user_count > 0 and user_count % interval == 0:
+                content = m.get("content", "")
+                is_tool_result = (
+                    "<tool_result" in str(content) or "<tool_error" in str(content)
+                )
+                if not is_tool_result:
+                    logging.getLogger("thalamus.tool-prompt").info(
+                        f"LTLP stub reminder injected at user turn {user_count}"
+                    )
+                    out.append({"role": "user", "content": reminder})
+                    out.append({"role": "assistant", "content": "(tools noted)"})
+        out.append(m)
+
+    return out
 
 
 def _merge_consecutive_same_role(messages: list[dict]) -> list[dict]:

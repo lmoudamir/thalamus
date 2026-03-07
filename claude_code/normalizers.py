@@ -49,6 +49,8 @@ _CC_TO_CURSOR_MODEL_MAP = {
     "sonnet": _CLAUDE_FALLBACK,
     "opus": _CLAUDE_FALLBACK,
     "haiku": _CLAUDE_FALLBACK,
+    "fast": "gpt-5.3-codex-spark-preview-low",
+    "thalamus": "gemini-3.1-pro",
 }
 
 

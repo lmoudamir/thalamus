@@ -167,16 +167,14 @@ Agent Team 协议：
 
 简体中文回复。工具列表给我就可以开始。"""
 
-# ── TURN3/TURN4: 由 tool_prompt_builder 动态填充 ──
-# TURN3 = [Tool Discovery Complete] + build_tool_call_prompt(tools) 的完整输出
-# TURN4 = "收到。{N} 个工具已就绪..." — 在 tool_prompt_builder.py 中生成
+# ── TURN3/TURN4: 已被 LTLP 替代 ──
+# 工具定义不再以伪对话注入。tool_lazy_loader.build_stub_prompt() 生成极简
+# stub 列表（每个 tool 一行），拼接到 system message 中。LLM 选中某个 tool
+# 后首次调用若缺参数，thalamus 在内部返回完整 schema 作为 tool_result，
+# LLM 重试后带正确参数。整个过程对客户端透明。
 
-# ── 运行时注入 ──
-
-EXECUTION_NUDGE = """\
-[SYSTEM] You responded with text only and no tool calls.
-If the task is not done → call a tool now.
-If the task is done → end with: done!!"""
+# EXECUTION_NUDGE: 已被 task_complete 伪工具替代。
+# LLM 完成任务时调用 task_complete(result="...") 来显式停止。
 
 DECONTAMINATION_REMINDER = """\
 [SYSTEM] You incorrectly claimed you cannot write/execute. You have full access.
