@@ -39,14 +39,8 @@ from claude_code.tool_prompt_builder import inject_tool_prompt_into_messages, _m
 from config.system_prompt import THALAMUS_INSTRUCTION_SUPPLEMENT
 from claude_code.tool_parser import try_parse_tool_calls_from_text
 from claude_code.tool_lazy_loader import (
-    build_stub_prompt,
-    build_stub_reminder,
-    build_schema_store,
-    partition_stub_calls,
-    format_schema_for_loading,
     is_task_complete_call,
     extract_task_complete_result,
-    STUB_REMINDER_INTERVAL,
     CONTINUATION_PROMPT,
     MAX_CONTINUATION_RETRIES,
 )
@@ -72,6 +66,8 @@ FATAL_ERROR_PATTERNS: list[re.Pattern] = [
 ]
 
 TOOL_JSON_START_MARKERS: list[str] = [
+    '{"type":"tool_use"',
+    '{"type": "tool_use"',
     '{"tool_calls"',
     '"tool_calls":',
     "```json",
@@ -296,6 +292,7 @@ def extract_text_before_json(full_text: str) -> str:
     if not full_text:
         return ""
     patterns = [
+        re.compile(r'\{"type"\s*:\s*"tool_use"'),
         re.compile(r'\{[\s\S]*?"tool_calls"\s*:\s*\['),
         re.compile(r'```(?:json)?\s*\{[\s\S]*?"tool_calls"'),
         re.compile(r"<tool_call>\s*\{"),
@@ -540,7 +537,6 @@ async def consume_stream(
 # ---------------------------------------------------------------------------
 
 
-MAX_SCHEMA_RETRIES = 2
 
 
 async def _call_cursor_direct(
@@ -551,20 +547,13 @@ async def _call_cursor_direct(
     auth_token: str,
     on_stream_delta: Callable[[str], Any] | None = None,
     on_thinking_delta: Callable[[str], Any] | None = None,
-    schema_store: dict[str, dict] | None = None,
 ) -> dict:
-    """Call Cursor API with LTLP: stub injection, schema-on-demand retry, and fallback."""
+    """Call Cursor API with tool schema injection, continuation retry, and fallback."""
     start_time = time.monotonic()
     request_id = f"cc_{uuid.uuid4().hex[:12]}"
 
-    stub_reminder = build_stub_reminder(tools) if tools else ""
-    injected_base = inject_tool_prompt_into_messages(
-        messages, tools,
-        stub_reminder=stub_reminder,
-        reminder_interval=STUB_REMINDER_INTERVAL,
-    )
+    injected_base = inject_tool_prompt_into_messages(messages, tools)
     has_valid_tools = bool(valid_tool_names)
-    schema_store = schema_store or {}
     all_valid_names = list(valid_tool_names) + (["task_complete"] if has_valid_tools else [])
 
     fallback_cfg = load_fallback_config()
@@ -691,86 +680,6 @@ async def _call_cursor_direct(
                 "fallback_attempts": len(tried_models),
                 "stats": {"passed": 0, "normalized": 0, "filtered": 0, "invalid_arguments_filtered": 0},
             }
-
-        # ── LTLP: stub call detection + schema retry inner loop ──
-        if converted_tcs and schema_store:
-            schema_retries = 0
-            while converted_tcs and schema_retries < MAX_SCHEMA_RETRIES:
-                # Check for task_complete first
-                for tc in converted_tcs:
-                    if is_task_complete_call(tc):
-                        tc_result = extract_task_complete_result(tc)
-                        logger.info(f"[{request_id}] task_complete received: {tc_result[:200]}")
-                        text_before = extract_text_before_json(consumed["text"])
-                        return {
-                            "text": text_before if text_before else tc_result,
-                            "task_complete_text": tc_result,
-                            "thinking": consumed["thinking"],
-                            "model": current_model,
-                            "fallback_attempts": len(tried_models),
-                            "stats": {"passed": 0, "normalized": 0, "filtered": 0, "invalid_arguments_filtered": 0},
-                        }
-
-                stub_calls, real_calls = partition_stub_calls(converted_tcs, schema_store)
-
-                if not stub_calls:
-                    break
-
-                schema_retries += 1
-                loaded_names = [(sc.get("function") or {}).get("name", "?") for sc in stub_calls]
-                logger.info(
-                    f"[{request_id}] LTLP schema loading (retry {schema_retries}/{MAX_SCHEMA_RETRIES}) | "
-                    f"stubs={loaded_names} real={len(real_calls)}"
-                )
-
-                for stub in stub_calls:
-                    tool_name = (stub.get("function") or {}).get("name", "")
-                    full_schema = schema_store.get(tool_name)
-                    if not full_schema:
-                        continue
-                    schema_text = format_schema_for_loading(full_schema)
-
-                    injected_base.append({
-                        "role": "assistant",
-                        "content": json.dumps({"tool_calls": [{"function": {"name": tool_name, "arguments": {}}}]}),
-                    })
-                    injected_base.append({
-                        "role": "user",
-                        "content": f'<tool_result name="{tool_name}">\n{schema_text}\n</tool_result>',
-                    })
-
-                injected_base = _merge_consecutive_same_role(injected_base)
-
-                logger.info(f"[{request_id}] LTLP calling Cursor again with schema context | msgs={len(injected_base)}")
-                try:
-                    path2, headers2, body2 = build_cursor_stream_params(
-                        auth_token, injected_base, current_model
-                    )
-                    async with open_streaming_h2_request(path2, headers2, body2) as stream_iter2:
-                        consumed2 = await consume_stream(stream_iter2)
-                except Exception as exc2:
-                    logger.error(f"[{request_id}] LTLP schema retry stream error: {exc2}")
-                    break
-
-                if consumed2["has_fatal_error"] or (consumed2["errors"] and not consumed2["had_content"]):
-                    logger.warn(f"[{request_id}] LTLP schema retry got fatal error, using real_calls")
-                    converted_tcs = real_calls
-                    break
-
-                logger.info(f"[{request_id}] LTLP retry response | text_len={len(consumed2['text'])}")
-                parsed_tcs2 = try_parse_tool_calls_from_text(consumed2["text"])
-                if parsed_tcs2:
-                    result2 = post_process_tool_calls(parsed_tcs2, all_valid_names)
-                    converted_tcs = result2.get("processed") or []
-                    if converted_tcs:
-                        converted_tcs = _fix_garbled_paths_in_tool_calls(converted_tcs)
-                    consumed["text"] = consumed2["text"]
-                    consumed["thinking"] = consumed2.get("thinking", "")
-                else:
-                    consumed["text"] = consumed2["text"]
-                    consumed["thinking"] = consumed2.get("thinking", "")
-                    converted_tcs = []
-                    break
 
         # Filter out task_complete from final tool_calls (it's a pseudo-tool)
         if converted_tcs:
@@ -1128,11 +1037,7 @@ async def run_pipeline(
     original_format = req.original_format
     valid_tool_names = [(t.get("function") or t).get("name", "") for t in tools]
 
-    stub_prompt = build_stub_prompt(tools) if tools else ""
-    schema_store = build_schema_store(tools) if tools else {}
     full_system = (req.system or "") + THALAMUS_INSTRUCTION_SUPPLEMENT
-    if stub_prompt:
-        full_system += "\n\n" + stub_prompt
     messages = [{"role": "system", "content": full_system}] + messages
 
     if req.metadata:
@@ -1193,14 +1098,14 @@ async def run_pipeline(
         return _build_streaming_result(
             req, request_id, messages, tools, valid_tool_names,
             resolved_model, max_tokens, token, original_format,
-            pipeline_start, base_telemetry, schema_store,
+            pipeline_start, base_telemetry,
         )
 
     # --- Non-streaming (unary) path ---
     return await _build_unary_result(
         req, request_id, messages, tools, valid_tool_names,
         resolved_model, max_tokens, token, original_format,
-        pipeline_start, base_telemetry, schema_store,
+        pipeline_start, base_telemetry,
     )
 
 
@@ -1216,7 +1121,6 @@ def _build_streaming_result(
     original_format: str,
     pipeline_start: float,
     base_telemetry: dict[str, Any],
-    schema_store: dict[str, dict] | None = None,
 ) -> dict:
     """Build the streaming result dict with an async generator."""
 
@@ -1224,12 +1128,12 @@ def _build_streaming_result(
         return _build_streaming_result_openai(
             request_id, messages, tools, valid_tool_names,
             resolved_model, max_tokens, token,
-            pipeline_start, base_telemetry, schema_store,
+            pipeline_start, base_telemetry,
         )
     return _build_streaming_result_anthropic(
         request_id, messages, tools, valid_tool_names,
         resolved_model, max_tokens, token,
-        pipeline_start, base_telemetry, schema_store,
+        pipeline_start, base_telemetry,
     )
 
 
@@ -1243,7 +1147,6 @@ def _build_streaming_result_anthropic(
     token: str,
     pipeline_start: float,
     base_telemetry: dict[str, Any],
-    schema_store: dict[str, dict] | None = None,
 ) -> dict:
     message_id = f"msg_{uuid.uuid4().hex}"
 
@@ -1302,7 +1205,6 @@ def _build_streaming_result_anthropic(
                 messages, resolved_model, tools, valid_tool_names, token,
                 on_stream_delta=on_text_delta,
                 on_thinking_delta=on_thinking_as_text,
-                schema_store=schema_store,
             )
 
         cursor_task = asyncio.create_task(run_cursor_call())
@@ -1385,7 +1287,6 @@ def _build_streaming_result_openai(
     token: str,
     pipeline_start: float,
     base_telemetry: dict[str, Any],
-    schema_store: dict[str, dict] | None = None,
 ) -> dict:
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
 
@@ -1412,7 +1313,6 @@ def _build_streaming_result_openai(
             return await _call_cursor_direct(
                 messages, resolved_model, tools, valid_tool_names, token,
                 on_stream_delta=on_text_delta,
-                schema_store=schema_store,
             )
 
         cursor_task = asyncio.create_task(run_cursor_call())
@@ -1484,13 +1384,11 @@ async def _build_unary_result(
     original_format: str,
     pipeline_start: float,
     base_telemetry: dict[str, Any],
-    schema_store: dict[str, dict] | None = None,
 ) -> dict:
     """Build a non-streaming result."""
 
     direct_result = await _call_cursor_direct(
         messages, resolved_model, tools, valid_tool_names, token,
-        schema_store=schema_store,
     )
 
     logger.info(

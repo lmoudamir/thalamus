@@ -698,6 +698,41 @@ def _parse_text_mimicry(text: str) -> list[dict] | None:
     return results if results else None
 
 
+def parse_anthropic_tool_use_blocks(text: str) -> list[dict] | None:
+    """PRIMARY strategy: extract Anthropic native tool_use JSON blocks.
+
+    Looks for {"type":"tool_use", ...} JSON objects in the text.
+    This is the expected output format when the model has learned from
+    consistent Anthropic JSON examples in conversation history.
+    """
+    if not text or '"tool_use"' not in text:
+        return None
+
+    results: list[dict] = []
+    json_objects = extract_all_json_objects(text)
+
+    for item in json_objects:
+        obj = item["obj"]
+        if not isinstance(obj, dict):
+            continue
+        if obj.get("type") != "tool_use":
+            continue
+        name = obj.get("name", "")
+        if not isinstance(name, str) or not name.strip():
+            continue
+        raw_input = obj.get("input") or {}
+        results.append({
+            "id": obj.get("id") or f"call_{uuid.uuid4().hex[:12]}",
+            "type": "function",
+            "function": {
+                "name": name,
+                "arguments": json.dumps(raw_input) if not isinstance(raw_input, str) else raw_input,
+            },
+        })
+
+    return results if results else None
+
+
 def try_parse_tool_calls_from_text(
     text: str,
     strict_json_only: bool = True,
@@ -705,6 +740,13 @@ def try_parse_tool_calls_from_text(
     """
     Extract tool calls from LLM text output.
     Returns a list of normalized tool call dicts or None if no tool calls found.
+
+    Strategy order:
+      1. anthropic_tool_use  — native Anthropic JSON (PRIMARY, expected format)
+      2. text_mimicry        — catch text that mimics tool calls
+      3. direct_json         — {"tool_calls":[...]} (legacy)
+      4. code_block          — ```json ... ``` blocks (legacy)
+      5-8. other fallbacks   — various recovery strategies
     """
     if not text:
         return None
@@ -712,6 +754,15 @@ def try_parse_tool_calls_from_text(
     preview = trimmed[:180]
     snippet = re.sub(r"\s+", " ", trimmed[:160])
     _logger.debug(f"Parsing text len={len(trimmed)} preview={preview}")
+
+    # PRIMARY: Anthropic native tool_use JSON
+    anthropic_result = parse_anthropic_tool_use_blocks(trimmed)
+    if anthropic_result:
+        _logger.info(
+            f"parse_strategy=anthropic_tool_use raw_len={len(trimmed)} "
+            f"tool_count={len(anthropic_result)} candidate_snippet={snippet}"
+        )
+        return anthropic_result
 
     mimicry_result = _parse_text_mimicry(trimmed)
     if mimicry_result:

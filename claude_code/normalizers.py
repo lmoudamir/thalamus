@@ -41,32 +41,67 @@ def _remove_uri_format(schema: Any) -> Any:
     return result
 
 
-_CLAUDE_FALLBACK = "grok-code-fast-1"
+_CLAUDE_FALLBACK = "claude-4.5-haiku"
+
+_CURSOR_CLAUDE_MODELS = {
+    "claude-4.6-sonnet-medium",
+    "claude-4.6-sonnet-medium-thinking",
+    "claude-4.6-opus-high",
+    "claude-4.6-opus-max",
+    "claude-4.6-opus-high-thinking",
+    "claude-4.6-opus-high-thinking-fast",
+    "claude-4.6-opus-max-thinking",
+    "claude-4.6-opus-max-thinking-fast",
+    "claude-4.5-opus-high",
+    "claude-4.5-opus-high-thinking",
+    "claude-4.5-haiku",
+    "claude-4.5-haiku-thinking",
+    "claude-4.5-sonnet",
+    "claude-4.5-sonnet-thinking",
+    "claude-4-sonnet",
+    "claude-4-sonnet-1m",
+    "claude-4-sonnet-thinking",
+    "claude-4-sonnet-1m-thinking",
+}
 
 _CC_TO_CURSOR_MODEL_MAP = {
     "default": "default",
     "inherit": _CLAUDE_FALLBACK,
-    "sonnet": _CLAUDE_FALLBACK,
-    "opus": _CLAUDE_FALLBACK,
-    "haiku": _CLAUDE_FALLBACK,
+    "sonnet": "claude-4.5-sonnet",
+    "opus": "claude-4.5-opus-high",
+    "haiku": "claude-4.5-haiku",
     "fast": "gpt-5.3-codex-spark-preview-low",
     "thalamus": "gemini-3.1-pro",
+}
+
+_CC_ANTHROPIC_TO_CURSOR = {
+    "claude-sonnet-4": "claude-4-sonnet",
+    "claude-opus-4": "claude-4.5-opus-high",
+    "claude-haiku-4": "claude-4.5-haiku",
+    "claude-3-5-sonnet": "claude-4.5-sonnet",
+    "claude-3-5-haiku": "claude-4.5-haiku",
+    "claude-3-opus": "claude-4.5-opus-high",
 }
 
 
 def resolve_model_name(model_name: str) -> str:
     """Map CC external model names to Cursor-recognized names.
 
-    Handles CC-specific pseudo-names:
-      - "inherit": subagent inherits parent model (CC internal directive)
-      - "sonnet"/"opus"/"haiku": CC shorthand names (not valid API names)
-      - "claude-*": Anthropic model IDs rejected by Cursor
-    All of these route to grok-code-fast-1. Non-claude models pass through.
+    Priority:
+      1. Known Cursor claude model names → pass through directly
+      2. CC pseudo-names (sonnet/opus/haiku/inherit) → mapped
+      3. Anthropic API model IDs (claude-sonnet-4-20250514) → mapped via prefix
+      4. Other claude-* → fallback to claude-4.5-haiku
+      5. Non-claude models → pass through
     """
     if not model_name or not model_name.strip():
         return _CLAUDE_FALLBACK
 
     lower = model_name.lower().strip()
+
+    if lower in _CURSOR_CLAUDE_MODELS:
+        return lower
+
     if lower in _CC_TO_CURSOR_MODEL_MAP:
         resolved = _CC_TO_CURSOR_MODEL_MAP[lower]
         if lower != resolved:
@@ -74,7 +109,11 @@ def resolve_model_name(model_name: str) -> str:
         return resolved
 
     if lower.startswith("claude"):
-        logger.info(f"Model '{model_name}' (claude-*) mapped to '{_CLAUDE_FALLBACK}'")
+        for prefix, cursor_model in _CC_ANTHROPIC_TO_CURSOR.items():
+            if lower.startswith(prefix):
+                logger.info(f"Model '{model_name}' matched prefix '{prefix}' → '{cursor_model}'")
+                return cursor_model
+        logger.info(f"Model '{model_name}' (claude-*) fallback → '{_CLAUDE_FALLBACK}'")
         return _CLAUDE_FALLBACK
 
     return model_name
@@ -190,7 +229,11 @@ def normalize_anthropic(payload: dict) -> UnifiedRequest:
 def _convert_assistant_message(
     raw_content: Any, out: list[dict[str, Any]]
 ) -> None:
-    """Convert a single assistant message, handling text + tool_use + thinking."""
+    """Convert a single assistant message, handling text + tool_use + thinking.
+
+    Preserves the original Anthropic content array as `anthropic_content`
+    so downstream code can serialize it in native format instead of flattening.
+    """
     if isinstance(raw_content, str):
         out.append({"role": "assistant", "content": raw_content})
         return
@@ -200,6 +243,7 @@ def _convert_assistant_message(
 
     text_parts: list[str] = []
     tool_calls: list[dict[str, Any]] = []
+    anthropic_blocks: list[dict[str, Any]] = []
 
     for block in raw_content:
         if not isinstance(block, dict):
@@ -209,6 +253,7 @@ def _convert_assistant_message(
             t = block.get("text", "")
             if t:
                 text_parts.append(t)
+                anthropic_blocks.append(block)
         elif btype == "tool_use":
             tool_calls.append({
                 "type": "function",
@@ -218,8 +263,9 @@ def _convert_assistant_message(
                     "arguments": json.dumps(block.get("input") or {}),
                 },
             })
+            anthropic_blocks.append(block)
         elif btype == "thinking":
-            pass  # filtered out — Cursor doesn't support thinking blocks in input
+            pass
 
     new_msg: dict[str, Any] = {
         "role": "assistant",
@@ -227,6 +273,8 @@ def _convert_assistant_message(
     }
     if tool_calls:
         new_msg["tool_calls"] = tool_calls
+    if anthropic_blocks:
+        new_msg["anthropic_content"] = anthropic_blocks
     out.append(new_msg)
 
 
@@ -236,7 +284,8 @@ def _convert_user_message(
     """Convert a user message that may contain text, tool_result, or both.
 
     Emits role:tool messages BEFORE the role:user text (if any), matching
-    the expected OpenAI conversation order.
+    the expected OpenAI conversation order.  Preserves `anthropic_content`
+    for native-format serialization downstream.
     """
     if isinstance(raw_content, str):
         out.append({"role": "user", "content": raw_content})
@@ -247,6 +296,7 @@ def _convert_user_message(
 
     text_parts: list[str] = []
     tool_results: list[dict[str, Any]] = []
+    anthropic_blocks: list[dict[str, Any]] = []
 
     for block in raw_content:
         if not isinstance(block, dict):
@@ -261,20 +311,29 @@ def _convert_user_message(
                 "content": _flatten_tool_result_content(block.get("content")),
                 "is_error": bool(block.get("is_error")),
             })
+            anthropic_blocks.append(block)
         elif btype == "text":
             t = block.get("text", "")
             if t:
                 text_parts.append(t)
-        # other block types (image, etc.) — extract text if possible
+                anthropic_blocks.append(block)
         elif btype == "image":
             text_parts.append("[image]")
+            anthropic_blocks.append(block)
+        else:
+            anthropic_blocks.append(block)
 
     for tr in tool_results:
+        if anthropic_blocks:
+            tr["anthropic_content"] = anthropic_blocks
         out.append(tr)
 
     user_text = "\n\n".join(text_parts)
     if user_text:
-        out.append({"role": "user", "content": user_text})
+        msg: dict[str, Any] = {"role": "user", "content": user_text}
+        if anthropic_blocks:
+            msg["anthropic_content"] = anthropic_blocks
+        out.append(msg)
 
 
 def _text_from_content(content: Any) -> str:

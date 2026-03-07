@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-"""Tool call prompt builder — injects tool descriptions into messages.
+"""Tool call prompt builder — native Anthropic JSON format.
 
-Tool calling is handled entirely via prompt injection: tool descriptions
-are serialized into the system/user prompt as text, and the model outputs
-tool calls as JSON in its text response. No MCP/URI/protobuf tool call
-mechanism is used.
+Instead of flattening tool_use/tool_result into custom XML/text, we serialize
+them as native Anthropic JSON.  The model sees consistent structured examples
+in its conversation history and naturally learns to output the same format.
 """
 
 import json
@@ -56,18 +55,19 @@ ASK_MODE_CONTAMINATION_PATTERNS: list[re.Pattern] = [
 def build_tool_call_prompt(tools: list[dict]) -> str:
     """Build a text prompt describing available tools.
 
-    The model should output tool calls as JSON:
-      {"tool_calls": [{"function": {"name": "ToolName", "arguments": {...}}}]}
+    The model should output tool calls as Anthropic native JSON:
+      {"type":"tool_use","id":"toolu_xxx","name":"ToolName","input":{...}}
     """
     lines = [
         "You have access to the following tools.\n"
-        "When you need to perform an action, output a JSON object:\n"
-        '  {"tool_calls": [{"function": {"name": "<ToolName>", "arguments": {<params>}}}]}\n\n'
+        "When you need to perform an action, output Anthropic native tool_use JSON — "
+        "one per line, each on its own line after any text:\n"
+        '  {"type":"tool_use","id":"toolu_<unique>","name":"<ToolName>","input":{<params>}}\n\n'
         "Examples:\n"
-        '  {"tool_calls": [{"function": {"name": "Bash", "arguments": {"command": "ls -la"}}}]}\n'
-        '  {"tool_calls": [{"function": {"name": "Read", "arguments": {"file_path": "/tmp/app.go"}}}]}\n'
-        '  {"tool_calls": [{"function": {"name": "Write", "arguments": {"file_path": "/tmp/app.go", "content": "package main\\n"}}}]}\n'
-        '  {"tool_calls": [{"function": {"name": "Edit", "arguments": {"file_path": "/tmp/app.go", "old_string": "old", "new_string": "new"}}}]}\n'
+        '  {"type":"tool_use","id":"toolu_01","name":"Bash","input":{"command":"ls -la"}}\n'
+        '  {"type":"tool_use","id":"toolu_02","name":"Read","input":{"file_path":"/tmp/app.go"}}\n'
+        '  {"type":"tool_use","id":"toolu_03","name":"Write","input":{"file_path":"/tmp/app.go","content":"package main\\n"}}\n'
+        '  {"type":"tool_use","id":"toolu_04","name":"Edit","input":{"file_path":"/tmp/app.go","old_string":"old","new_string":"new"}}\n'
     ]
 
     count = 0
@@ -102,10 +102,140 @@ def build_tool_call_prompt(tools: list[dict]) -> str:
         )
 
     lines.append(
-        f"\nTotal: {count} tool(s). Use tool_calls JSON for ALL actions — never narrate."
+        f"\nTotal: {count} tool(s). Use tool_use JSON for ALL actions — never narrate."
     )
 
     return "\n\n".join(lines)
+
+
+def _serialize_anthropic_tool_use(block: dict) -> str:
+    """Serialize a single tool_use block to a compact JSON line."""
+    return json.dumps({
+        "type": "tool_use",
+        "id": block.get("id", ""),
+        "name": block.get("name", ""),
+        "input": block.get("input") or {},
+    }, ensure_ascii=False)
+
+
+def _serialize_anthropic_tool_result(block: dict) -> str:
+    """Serialize a single tool_result block to a compact JSON line."""
+    content = block.get("content", "")
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict):
+                parts.append(item.get("text", ""))
+            elif isinstance(item, str):
+                parts.append(item)
+        content = "\n".join(parts)
+    elif not isinstance(content, str):
+        content = str(content) if content else ""
+
+    obj: dict = {
+        "type": "tool_result",
+        "tool_use_id": block.get("tool_use_id", ""),
+        "content": content,
+    }
+    if block.get("is_error"):
+        obj["is_error"] = True
+    return json.dumps(obj, ensure_ascii=False)
+
+
+def _serialize_assistant_anthropic(msg: dict) -> str:
+    """Serialize an assistant message using Anthropic content blocks.
+
+    If `anthropic_content` is available, use it directly.
+    Otherwise fall back to intermediate format (content + tool_calls).
+    """
+    blocks = msg.get("anthropic_content")
+    if blocks and isinstance(blocks, list):
+        parts: list[str] = []
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type")
+            if btype == "text":
+                t = block.get("text", "")
+                if t.strip():
+                    parts.append(t)
+            elif btype == "tool_use":
+                parts.append(_serialize_anthropic_tool_use(block))
+        return "\n\n".join(parts) if parts else ""
+
+    # Fallback: reconstruct from intermediate format
+    parts = []
+    content = msg.get("content", "")
+    if isinstance(content, str) and content.strip():
+        parts.append(content)
+
+    for tc in msg.get("tool_calls") or []:
+        fn = tc.get("function") or tc
+        name = fn.get("name", "unknown")
+        raw_args = fn.get("arguments", "{}")
+        if isinstance(raw_args, str):
+            try:
+                args = json.loads(raw_args)
+            except (json.JSONDecodeError, ValueError):
+                args = {}
+        else:
+            args = raw_args or {}
+        tc_id = tc.get("id") or f"toolu_{name[:8]}"
+        parts.append(json.dumps({
+            "type": "tool_use",
+            "id": tc_id,
+            "name": name,
+            "input": args,
+        }, ensure_ascii=False))
+
+    return "\n\n".join(parts) if parts else ""
+
+
+def _serialize_tool_result_message(msg: dict, id_to_name: dict[str, str]) -> str:
+    """Serialize a role:tool message as Anthropic tool_result JSON."""
+    tid = msg.get("tool_call_id", "")
+    content = msg.get("content", "")
+    is_error = msg.get("is_error", False)
+
+    # Check if we have original anthropic_content blocks
+    anthropic = msg.get("anthropic_content")
+    if anthropic and isinstance(anthropic, list):
+        parts = []
+        for block in anthropic:
+            if isinstance(block, dict) and block.get("type") == "tool_result":
+                parts.append(_serialize_anthropic_tool_result(block))
+        if parts:
+            return "\n\n".join(parts)
+
+    obj: dict = {
+        "type": "tool_result",
+        "tool_use_id": tid,
+        "content": content if isinstance(content, str) else str(content),
+    }
+    if is_error:
+        obj["is_error"] = True
+    return json.dumps(obj, ensure_ascii=False)
+
+
+def _serialize_user_with_tool_results(msg: dict, id_to_name: dict[str, str]) -> str:
+    """Serialize a user message that contains tool_result blocks."""
+    anthropic = msg.get("anthropic_content")
+    if anthropic and isinstance(anthropic, list):
+        parts = []
+        for block in anthropic:
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type")
+            if btype == "tool_result":
+                parts.append(_serialize_anthropic_tool_result(block))
+            elif btype == "text":
+                t = block.get("text", "")
+                if t.strip():
+                    parts.append(t)
+        if parts:
+            return "\n\n".join(parts)
+
+    return msg.get("content", "")
 
 
 def _extract_message_content(msg: dict) -> str:
@@ -125,70 +255,46 @@ def _extract_message_content(msg: dict) -> str:
     return str(content) if content else ""
 
 
-def _extract_tool_results_from_content(content) -> list[dict]:
-    """Extract tool_result blocks from Anthropic-format content arrays.
-
-    Returns a list of dicts with keys: tool_use_id, content_text, is_error.
-    """
-    if not isinstance(content, list):
-        return []
-    results = []
-    for block in content:
-        if not isinstance(block, dict) or block.get("type") != "tool_result":
-            continue
-        tool_use_id = block.get("tool_use_id", "")
-        is_error = block.get("is_error", False)
-        inner = block.get("content", "")
-        if isinstance(inner, str):
-            text = inner
-        elif isinstance(inner, list):
-            text = "".join(
-                p.get("text", "") if isinstance(p, dict) else str(p) for p in inner
-            )
-        else:
-            text = str(inner) if inner else ""
-        results.append({
-            "tool_use_id": tool_use_id,
-            "content_text": text,
-            "is_error": is_error,
-        })
-    return results
-
-
 def _is_contaminated_assistant_message(content: str) -> bool:
     if not content:
         return False
     return any(p.search(content) for p in ASK_MODE_CONTAMINATION_PATTERNS)
 
 
-def _is_text_only_assistant_needing_nudge(content: str) -> bool:
-    if not content or not content.strip():
-        return False
-    if "done!!" in content:
-        return False
-    if re.search(r'\{"tool_calls"\s*:', content):
-        return False
-    if re.search(r'\{"function"\s*:', content):
-        return False
-    return True
+def _build_brief_reminder(tools: list[dict]) -> str:
+    """Compact tool-name reminder injected periodically into conversation."""
+    names = [(t.get("function") or t).get("name", "") for t in tools
+             if (t.get("function") or t).get("name")]
+    names.append("task_complete")
+    return (
+        f'[TOOL_REMINDER] {len(names)} tools: {", ".join(names)}. '
+        'ALWAYS execute tools via tool_use JSON — never narrate or simulate a call. '
+        'Only task_complete signals "done"; no task_complete = keep working. '
+        'Format: {"type":"tool_use","id":"toolu_<id>","name":"NAME","input":{...}}'
+    )
 
 
 def inject_tool_prompt_into_messages(
     messages: list[dict], tools: list[dict],
-    stub_reminder: str = "",
-    reminder_interval: int = 15,
+    reminder_interval: int = 10,
 ) -> list[dict]:
-    """Inject tool-call prompt and system turns into OpenAI-format messages.
+    """Inject tool schemas and system turns into messages.
 
-    If stub_reminder is provided, it's injected every reminder_interval
-    user-turns to keep tool protocol fresh in the LLM's attention window.
+    Inserts full tool descriptions (via build_tool_call_prompt) so the model
+    knows every available tool and its parameters.  Uses Anthropic native JSON
+    format for tool_use/tool_result serialization in conversation history.
     """
     result: list[dict] = []
 
     result.append({"role": "user", "content": TURN1_USER})
     result.append({"role": "assistant", "content": TURN2_ASSISTANT})
 
-    # Build tool_use_id → tool_name map for rich few-shot context
+    if tools:
+        tool_prompt = build_tool_call_prompt(tools)
+        result.append({"role": "user", "content": tool_prompt})
+        result.append({"role": "assistant", "content": "(tools noted, ready to use them)"})
+
+    # Build tool_use_id → tool_name map for context
     _tool_id_to_name: dict[str, str] = {}
     for m in messages:
         for src in [m.get("content", []), m.get("tool_calls", [])]:
@@ -202,105 +308,56 @@ def inject_tool_prompt_into_messages(
                 fn = block.get("function")
                 if isinstance(fn, dict) and fn.get("name"):
                     _tool_id_to_name[block.get("id", "")] = fn["name"]
+        anthropic = m.get("anthropic_content")
+        if isinstance(anthropic, list):
+            for block in anthropic:
+                if isinstance(block, dict) and block.get("type") == "tool_use":
+                    _tool_id_to_name[block.get("id", "")] = block.get("name", "unknown")
 
     for m in messages:
         role = m.get("role", "")
-        raw_content = m.get("content")
 
+        # --- role:tool → serialize as Anthropic tool_result JSON ---
         if role == "tool":
-            content = _extract_message_content(m)
-            tid = m.get("tool_call_id", "")
-            tname = _tool_id_to_name.get(tid, "")
-            tag = f" name=\"{tname}\"" if tname else ""
-            result.append({
-                "role": "user",
-                "content": f"<tool_result{tag}>\n{content}\n</tool_result>",
-            })
+            serialized = _serialize_tool_result_message(m, _tool_id_to_name)
+            result.append({"role": "user", "content": serialized})
             continue
 
-        if role == "user" and isinstance(raw_content, list):
-            tool_results = _extract_tool_results_from_content(raw_content)
-            if tool_results:
-                parts = []
-                for tr in tool_results:
-                    tname = _tool_id_to_name.get(tr["tool_use_id"], "")
-                    tag = f" name=\"{tname}\"" if tname else ""
-                    if tr["is_error"]:
-                        parts.append(
-                            f"<tool_error{tag}>\n"
-                            f"{tr['content_text']}\n"
-                            f"Fix the parameters and retry.\n"
-                            f"</tool_error>"
-                        )
-                    else:
-                        parts.append(
-                            f"<tool_result{tag}>\n"
-                            f"{tr['content_text']}\n"
-                            f"</tool_result>"
-                        )
-                non_tr_text = _extract_message_content(m)
-                if non_tr_text.strip():
-                    parts.append(non_tr_text)
-                result.append({
-                    "role": "user",
-                    "content": "\n\n".join(parts),
-                })
-                continue
-
-        if role == "user" and isinstance(raw_content, str):
-            if "<tool_use_error>" in raw_content:
-                result.append({
-                    "role": "user",
-                    "content": (
-                        f"<tool_error>\n"
-                        f"{raw_content}\n"
-                        f"Fix the parameters and retry.\n"
-                        f"</tool_error>"
-                    ),
-                })
-                continue
-
-        if role == "assistant":
-            import json as _json
-            tool_calls_list = m.get("tool_calls") or []
-            if tool_calls_list:
-                parts = []
-                content_text = _extract_message_content(m)
-                if content_text.strip():
-                    parts.append(content_text)
-                tc_json_list = []
-                for tc in tool_calls_list:
-                    fn = tc.get("function") or tc
-                    tc_json_list.append({"function": {"name": fn.get("name", "unknown"), "arguments": _json.loads(fn.get("arguments", "{}")) if isinstance(fn.get("arguments"), str) else fn.get("arguments", {})}})
-                parts.append(_json.dumps({"tool_calls": tc_json_list}, ensure_ascii=False))
-                result.append({
-                    "role": "assistant",
-                    "content": "\n".join(parts),
-                })
-                continue
-
-            if isinstance(raw_content, list):
-                has_tool_use = any(
-                    isinstance(b, dict) and b.get("type") == "tool_use"
-                    for b in raw_content
+        # --- user with tool_result content blocks ---
+        if role == "user":
+            anthropic = m.get("anthropic_content")
+            has_tool_result = False
+            if isinstance(anthropic, list):
+                has_tool_result = any(
+                    isinstance(b, dict) and b.get("type") == "tool_result"
+                    for b in anthropic
                 )
-                if has_tool_use:
-                    parts = []
-                    tc_json_list = []
-                    for block in raw_content:
-                        if isinstance(block, dict):
-                            if block.get("type") == "text":
-                                t = block.get("text", "")
-                                if t.strip():
-                                    parts.append(t)
-                            elif block.get("type") == "tool_use":
-                                tc_json_list.append({"function": {"name": block.get("name", "unknown"), "arguments": block.get("input", {})}})
-                    if tc_json_list:
-                        parts.append(_json.dumps({"tool_calls": tc_json_list}, ensure_ascii=False))
-                    result.append({
-                        "role": "assistant",
-                        "content": "\n".join(parts) if parts else "(ok)",
-                    })
+
+            if has_tool_result:
+                serialized = _serialize_user_with_tool_results(m, _tool_id_to_name)
+                result.append({"role": "user", "content": serialized})
+                continue
+
+            raw_content = m.get("content", "")
+            if isinstance(raw_content, str) and "<tool_use_error>" in raw_content:
+                result.append({
+                    "role": "user",
+                    "content": json.dumps({
+                        "type": "tool_result",
+                        "tool_use_id": "unknown",
+                        "is_error": True,
+                        "content": raw_content,
+                    }, ensure_ascii=False),
+                })
+                continue
+
+        # --- assistant → serialize with Anthropic tool_use JSON ---
+        if role == "assistant":
+            has_tools = bool(m.get("tool_calls")) or bool(m.get("anthropic_content"))
+            if has_tools:
+                serialized = _serialize_assistant_anthropic(m)
+                if serialized.strip():
+                    result.append({"role": "assistant", "content": serialized})
                     continue
 
             content = _extract_message_content(m)
@@ -311,8 +368,9 @@ def inject_tool_prompt_into_messages(
 
         result.append(m)
 
-    if stub_reminder and reminder_interval > 0:
-        result = _inject_periodic_reminders(result, stub_reminder, reminder_interval)
+    if tools and reminder_interval > 0:
+        reminder = _build_brief_reminder(tools)
+        result = _inject_periodic_reminders(result, reminder, reminder_interval)
 
     result = _merge_consecutive_same_role(result)
     return result
@@ -321,16 +379,7 @@ def inject_tool_prompt_into_messages(
 def _inject_periodic_reminders(
     messages: list[dict], reminder: str, interval: int
 ) -> list[dict]:
-    """Insert a tool-protocol reminder every `interval` user turns.
-
-    Walks the converted message list and counts user messages (skipping
-    the initial TURN1 priming message at index 0).  After every `interval`th
-    user message, a synthetic assistant ack + user reminder pair is inserted
-    so the LLM re-attends to the tool-calling protocol.
-
-    The injection only happens between user→assistant boundaries — never
-    inside a tool_result flow — to avoid breaking the conversation structure.
-    """
+    """Insert a tool-protocol reminder every `interval` user turns."""
     if interval <= 0 or not reminder:
         return messages
 
@@ -347,12 +396,10 @@ def _inject_periodic_reminders(
             user_count += 1
             if user_count > 0 and user_count % interval == 0:
                 content = m.get("content", "")
-                is_tool_result = (
-                    "<tool_result" in str(content) or "<tool_error" in str(content)
-                )
+                is_tool_result = '"type":"tool_result"' in str(content) or '"type": "tool_result"' in str(content)
                 if not is_tool_result:
                     logging.getLogger("thalamus.tool-prompt").info(
-                        f"LTLP stub reminder injected at user turn {user_count}"
+                        f"Tool reminder injected at user turn {user_count}"
                     )
                     out.append({"role": "user", "content": reminder})
                     out.append({"role": "assistant", "content": "(tools noted)"})
@@ -362,10 +409,7 @@ def _inject_periodic_reminders(
 
 
 def _merge_consecutive_same_role(messages: list[dict]) -> list[dict]:
-    """Merge consecutive messages with the same role to avoid API errors.
-
-    Preserves [Tool Result] / [Tool Error] boundaries to maintain conversation context.
-    """
+    """Merge consecutive messages with the same role to avoid API errors."""
     if not messages:
         return messages
     merged: list[dict] = [messages[0]]
