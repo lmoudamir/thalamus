@@ -52,7 +52,7 @@ def extract_balanced_text(
 
 
 def relaxed_json_parse(text: str) -> Any:
-    """Try json.loads first. If it fails, fix trailing commas and retry."""
+    """Try json.loads first. If it fails, apply progressive fixups and retry."""
     try:
         return json.loads(text)
     except json.JSONDecodeError:
@@ -62,6 +62,23 @@ def relaxed_json_parse(text: str) -> Any:
         return json.loads(sanitized)
     except json.JSONDecodeError:
         pass
+    # Fix "key">value  ->  "key":value  (model sometimes emits > instead of :)
+    gt_fixed = re.sub(r'">\s*(?="|\{|\[|true|false|null|-?\d)', '":', text)
+    if gt_fixed != text:
+        gt_fixed = re.sub(r",\s*([}\]])", r"\1", gt_fixed)
+        try:
+            return json.loads(gt_fixed)
+        except json.JSONDecodeError:
+            pass
+    # Fix "key">unquoted text"  ->  "key":"unquoted text"
+    # Handles cases where > replaces : before a value that ends with "
+    gt_unquoted = re.sub(r'">([^"]*?)"', lambda m: '":"' + m.group(1) + '"', text)
+    if gt_unquoted != text:
+        gt_unquoted = re.sub(r",\s*([}\]])", r"\1", gt_unquoted)
+        try:
+            return json.loads(gt_unquoted)
+        except json.JSONDecodeError:
+            pass
     replaced = ""
     for ch in text:
         if ord(ch) <= 0x1F:
@@ -179,6 +196,8 @@ def is_tool_call_shape(obj: Any) -> bool:
     fn = obj.get("function")
     if isinstance(fn, dict) and isinstance(fn.get("name"), str) and "arguments" in fn:
         return True
+    if isinstance(fn, str) and fn.strip() and "arguments" in obj:
+        return True
     if isinstance(obj.get("name"), str) and "arguments" in obj:
         return True
     return False
@@ -190,11 +209,13 @@ def _is_structured_tool_call_array(value: Any) -> bool:
     for entry in value:
         if not entry or not isinstance(entry, dict):
             return False
-        fn_name = (
-            (entry.get("function") or {}).get("name")
-            if isinstance(entry.get("function"), dict)
-            else entry.get("name")
-        ) or ""
+        fn = entry.get("function")
+        if isinstance(fn, dict):
+            fn_name = fn.get("name", "")
+        elif isinstance(fn, str) and fn.strip():
+            fn_name = fn
+        else:
+            fn_name = entry.get("name", "")
         if not isinstance(fn_name, str) or not fn_name.strip():
             return False
     return True
@@ -358,6 +379,74 @@ def parse_tool_calls_from_embedded_object(text: str) -> list[dict] | None:
     return None
 
 
+def _try_recover_gt_corruption(text: str) -> Any | None:
+    """Recover JSON where '>' was used instead of ':' before values.
+
+    Handles patterns where the model emits "key">value instead of "key":value.
+    The value may contain raw newlines, braces, and other chars that need escaping.
+    """
+    if '">' not in text:
+        return None
+
+    fixed = text
+    for m in re.finditer(r'"(\w+)">', fixed):
+        gt_pos = m.end() - 1
+        # Replace "> with ":"
+        fixed = fixed[:gt_pos] + ':"' + fixed[gt_pos + 1:]
+
+    if fixed == text:
+        return None
+
+    fixed = re.sub(r",\s*([}\]])", r"\1", fixed)
+
+    try:
+        return json.loads(fixed)
+    except json.JSONDecodeError:
+        pass
+
+    # The value may contain raw control characters (newlines, tabs) that need escaping.
+    # Find each "key":"value" pair where value has control chars and escape them.
+    def _escape_control_in_values(s: str) -> str:
+        result = []
+        i = 0
+        in_string = False
+        escaped = False
+        while i < len(s):
+            ch = s[i]
+            if in_string:
+                if escaped:
+                    escaped = False
+                    result.append(ch)
+                elif ch == '\\':
+                    escaped = True
+                    result.append(ch)
+                elif ch == '"':
+                    in_string = False
+                    result.append(ch)
+                elif ch == '\n':
+                    result.append('\\n')
+                elif ch == '\r':
+                    result.append('\\r')
+                elif ch == '\t':
+                    result.append('\\t')
+                elif ord(ch) < 0x20:
+                    result.append(f'\\u{ord(ch):04x}')
+                else:
+                    result.append(ch)
+            else:
+                if ch == '"':
+                    in_string = True
+                result.append(ch)
+            i += 1
+        return ''.join(result)
+
+    escaped_fixed = _escape_control_in_values(fixed)
+    try:
+        return json.loads(escaped_fixed)
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+
 def parse_tool_calls_from_malformed_payload(text: str) -> list[dict] | None:
     """Recover from malformed JSON by finding 'function' keys."""
     if not text or '"tool_calls"' not in text:
@@ -387,6 +476,14 @@ def parse_tool_calls_from_malformed_payload(text: str) -> list[dict] | None:
         except (json.JSONDecodeError, ValueError):
             pass
         search_idx = obj_start + len(fn_obj_text)
+
+    if not recovered:
+        gt_recovered = _try_recover_gt_corruption(trimmed)
+        if gt_recovered and isinstance(gt_recovered, dict):
+            tcs = gt_recovered.get("tool_calls")
+            if isinstance(tcs, list) and tcs:
+                return normalize_tool_calls(tcs)
+
     if not recovered:
         return None
     return normalize_tool_calls(recovered)
