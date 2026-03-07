@@ -13,6 +13,7 @@
   <a href="#key-features">Features</a> •
   <a href="#how-it-works">How It Works</a> •
   <a href="#configuration">Config</a> •
+  <a href="#desktop-app">Desktop App</a> •
   <a href="#中文说明">中文</a>
 </p>
 
@@ -299,6 +300,34 @@ All settings go in `.env` (copy from `.env.example`). Most users only need `CURS
 | Cursor → Protobuf | ✅ | ✅ | ❌ | ❌ |
 | Works with Claude Code | ✅ | ❌ | ✅ | ✅ |
 
+## Desktop App
+
+> **[Download Thalamus.app (macOS)](https://github.com/guojun21/thalamus/releases/latest/download/Thalamus-macOS.zip)**
+
+A native macOS desktop launcher that wraps Thalamus into a one-click experience:
+
+- **One-click start** — double-click the app icon, backend starts automatically
+- **Built-in login** — Cursor PKCE login with automatic token save
+- **API test panel** — test model list and send messages with model selection
+- **Lightweight** — Swift + WKWebView, ~270KB, no Electron
+
+### Install from Release
+
+1. Download [`Thalamus-macOS.zip`](https://github.com/guojun21/thalamus/releases/latest/download/Thalamus-macOS.zip)
+2. Unzip and drag `Thalamus.app` to `/Applications`
+3. Double-click to launch
+
+### Build from Source
+
+```bash
+cd thalamus
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+cd desktop-app && bash build.sh
+```
+
+> **Note:** The app requires Python 3.10+ and thalamus-py dependencies to be installed on your system.
+
 ## Architecture
 
 ```
@@ -563,6 +592,26 @@ claude
 ```bash
 export OPENAI_BASE_URL=http://localhost:3013/v1
 export OPENAI_API_KEY=thalamus-proxy
+```
+
+### 桌面应用
+
+> **[下载 Thalamus.app (macOS)](https://github.com/guojun21/thalamus/releases/latest/download/Thalamus-macOS.zip)**
+
+原生 macOS 桌面启动器，双击即用：
+
+- 自动启动 thalamus-py 后端
+- 内置 Cursor 登录（PKCE 认证，Token 自动保存）
+- API 测试面板（模型列表 + 消息测试，可切换模型）
+- 轻量级：Swift + WKWebView，~270KB，无需 Electron
+
+**从源码构建：**
+
+```bash
+cd thalamus
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+cd desktop-app && bash build.sh
 ```
 
 ### 常见问题
